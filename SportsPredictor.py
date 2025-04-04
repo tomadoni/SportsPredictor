@@ -77,7 +77,7 @@ if home_team != away_team:
         home_stats = team_stats[team_stats["Team"] == home_team][raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][raw_features].values[0]
         diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -1.8, 1.8)
+        clipped_vector = np.clip(diff_vector, -1.4, 1.4)
 
         # Scale only the 5 features (not home indicator)
         diff_scaled = scaler.transform([clipped_vector])[0]
@@ -168,7 +168,7 @@ if home != away:
     input_scaled = scaler.transform([stat_diff])
 
     # ✅ Multiply home_indicator by 25 during prediction
-    home_indicator = matchup['home_indicator'].iloc[0] * -25
+    home_indicator = matchup['home_indicator'].iloc[0] * -20
     input_combined = np.hstack([input_scaled, [[home_indicator]]])
 
     # Predict
