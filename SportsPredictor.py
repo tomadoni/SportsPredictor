@@ -186,6 +186,9 @@ if home != away:
 else:
     st.warning("Please select two different teams.")
 
+
+# MLB
+
 # --- Load Training Data ---
 matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
 team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")
@@ -241,7 +244,7 @@ if home_team != away_team:
         home_stats = team_stats[team_stats["Team"] == home_team][raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][raw_features].values[0]
         diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -0.5, 0.5)
+        clipped_vector = np.clip(diff_vector, -0.05, 0.05)
 
         # Scale and append amplified home field indicator
         diff_scaled = scaler.transform([clipped_vector])[0]
