@@ -193,17 +193,18 @@ else:
 matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
 team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")
 
-# --- Define Features ---
-raw_features = ['OPS', 'AVG', 'OBP', 'SLG', 'R', 'HR', 'ERA', 'WHIP', 'SO', 'OBA', 'HR_allowed']
-diff_features = ['diff_' + f for f in raw_features]
+# --- Define Selected Features ---
+selected_raw_features = ['OPS', 'AVG', 'OBP', 'SLG', 'R', 'ERA']
+diff_features = ['diff_' + f for f in selected_raw_features]
 model_features = diff_features + ['home_indicator']
 
-# --- Separate features ---
+# --- Prepare Feature Matrix and Labels ---
 X_stats = matchup_df[diff_features]
 X_home = matchup_df[['home_indicator']]
 y = matchup_df["Winner"]
 
 # --- Scale stat features only ---
+from sklearn.preprocessing import StandardScaler
 scaler = StandardScaler()
 X_stats_scaled = scaler.fit_transform(X_stats)
 
@@ -211,13 +212,18 @@ X_stats_scaled = scaler.fit_transform(X_stats)
 X_combined = np.hstack([X_stats_scaled, X_home.values])
 
 # --- Train/Test Split ---
+from sklearn.model_selection import train_test_split
 X_train, X_test, y_train, y_test = train_test_split(
     X_combined, y, test_size=0.2, random_state=42, stratify=y
 )
 
-# --- Random Forest with Calibration ---
+# --- Train Random Forest with Calibration ---
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
+
 rf = RandomForestClassifier(n_estimators=500, max_depth=10, random_state=42)
-model = CalibratedClassifierCV(estimator=rf, method='sigmoid', cv=5)
+model = CalibratedClassifierCV(base_estimator=rf, method='sigmoid', cv=5)
 model.fit(X_train, y_train)
 
 # --- Evaluation ---
@@ -229,8 +235,11 @@ brier = brier_score_loss(y_test, probs_test)
 logloss = log_loss(y_test, model.predict_proba(X_test))
 
 # --- Streamlit App ---
+import streamlit as st
+import numpy as np
+
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using Random Forests trained on hitting + pitching differentials.")
+st.markdown("Predict MLB matchups using top predictive features and Random Forest classifier.")
 
 teams = sorted(team_stats["Team"].unique())
 col1, col2 = st.columns(2)
@@ -241,14 +250,14 @@ with col2:
 
 if home_team != away_team:
     try:
-        home_stats = team_stats[team_stats["Team"] == home_team][raw_features].values[0]
-        away_stats = team_stats[team_stats["Team"] == away_team][raw_features].values[0]
+        home_stats = team_stats[team_stats["Team"] == home_team][selected_raw_features].values[0]
+        away_stats = team_stats[team_stats["Team"] == away_team][selected_raw_features].values[0]
         diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -0.03, 0.03)
+        clipped_vector = np.clip(diff_vector, -0.03, 0.03)  # Optional: Adjust if needed
 
-        # Scale and append amplified home field indicator
+        # Scale and append home field indicator
         diff_scaled = scaler.transform([clipped_vector])[0]
-        final_vector = np.append(diff_scaled, 25)  # Amplified home field boost
+        final_vector = np.append(diff_scaled, 25)  # Home field boost
 
         # Predict
         probs = model.predict_proba([final_vector])[0]
