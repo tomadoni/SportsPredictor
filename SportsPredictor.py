@@ -223,7 +223,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
 
 rf = RandomForestClassifier(n_estimators=500, max_depth=10, random_state=42)
-model = CalibratedClassifierCV(base_estimator=rf, method='sigmoid', cv=5)
+model = CalibratedClassifierCV(estimator=rf, method='sigmoid', cv=5)
 model.fit(X_train, y_train)
 
 # --- Evaluation ---
