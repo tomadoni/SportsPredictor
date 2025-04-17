@@ -241,7 +241,7 @@ if home_team != away_team:
         home_stats = team_stats[team_stats["Team"] == home_team][raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][raw_features].values[0]
         diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -2.0, 2.0)
+        clipped_vector = np.clip(diff_vector, -0.5, 0.5)
 
         # Scale and append amplified home field indicator
         diff_scaled = scaler.transform([clipped_vector])[0]
