@@ -253,7 +253,7 @@ if home_team != away_team:
         home_stats = team_stats[team_stats["Team"] == home_team][selected_raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][selected_raw_features].values[0]
         diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -0.03, 0.03)  # Optional: Adjust if needed
+        clipped_vector = np.clip(diff_vector, -0.01, 0.01)  # Optional: Adjust if needed
 
         # Scale and append home field indicator
         diff_scaled = scaler.transform([clipped_vector])[0]
