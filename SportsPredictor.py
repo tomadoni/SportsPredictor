@@ -199,7 +199,13 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
 
 # --- Load Training Data ---
-matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")  # Historical training data only
+matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
+
+# Debugging logs
+st.write("Loaded training data:", matchup_df.shape)
+st.write("NaNs in Winner column:", matchup_df['Winner'].isna().sum())
+st.write("Sample rows:", matchup_df.head())
+
 team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")    # Updated combined team stats
 
 # --- Define Selected Features ---
