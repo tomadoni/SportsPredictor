@@ -187,11 +187,21 @@ else:
     st.warning("Please select two different teams.")
 
 
-# MLB
+# MLB Matchup Predictor App (Updated for Full Stats)
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
 
 # --- Load Training Data ---
-matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
-team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")
+matchup_df = pd.read_csv("Generated_Neutral_Matchups.csv")  # Use generated neutral matchups for future prediction
+historical_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
+team_stats = pd.read_csv("Updated_MLB_Combined_Team_Stats.csv")
 
 # --- Define Selected Features ---
 selected_raw_features = ['OPS', 'AVG', 'OBP', 'SLG', 'R', 'ERA']
@@ -199,12 +209,11 @@ diff_features = ['diff_' + f for f in selected_raw_features]
 model_features = diff_features + ['home_indicator']
 
 # --- Prepare Feature Matrix and Labels ---
-X_stats = matchup_df[diff_features]
-X_home = matchup_df[['home_indicator']]
-y = matchup_df["Winner"]
+X_stats = historical_df[diff_features]
+X_home = historical_df[['home_indicator']]
+y = historical_df["Winner"]
 
 # --- Scale stat features only ---
-from sklearn.preprocessing import StandardScaler
 scaler = StandardScaler()
 X_stats_scaled = scaler.fit_transform(X_stats)
 
@@ -212,16 +221,11 @@ X_stats_scaled = scaler.fit_transform(X_stats)
 X_combined = np.hstack([X_stats_scaled, X_home.values])
 
 # --- Train/Test Split ---
-from sklearn.model_selection import train_test_split
 X_train, X_test, y_train, y_test = train_test_split(
     X_combined, y, test_size=0.2, random_state=42, stratify=y
 )
 
 # --- Train Random Forest with Calibration ---
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
-
 rf = RandomForestClassifier(n_estimators=500, max_depth=10, random_state=42)
 model = CalibratedClassifierCV(estimator=rf, method='sigmoid', cv=5)
 model.fit(X_train, y_train)
@@ -235,11 +239,8 @@ brier = brier_score_loss(y_test, probs_test)
 logloss = log_loss(y_test, model.predict_proba(X_test))
 
 # --- Streamlit App ---
-import streamlit as st
-import numpy as np
-
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using top predictive features and Random Forest classifier.")
+st.markdown("Predict MLB matchups using updated stats and a Random Forest classifier.")
 
 teams = sorted(team_stats["Team"].unique())
 col1, col2 = st.columns(2)
@@ -253,11 +254,10 @@ if home_team != away_team:
         home_stats = team_stats[team_stats["Team"] == home_team][selected_raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][selected_raw_features].values[0]
         diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -0.005, 0.005)  # Optional: Adjust if needed
 
-        # Scale and append home field indicator
-        diff_scaled = scaler.transform([clipped_vector])[0]
-        final_vector = np.append(diff_scaled, 25)  # Home field boost
+        # Scale and append home indicator (0.5 for neutral)
+        diff_scaled = scaler.transform([diff_vector])[0]
+        final_vector = np.append(diff_scaled, 0.5)
 
         # Predict
         probs = model.predict_proba([final_vector])[0]
@@ -274,4 +274,3 @@ if home_team != away_team:
         st.error("Team stats not found.")
 else:
     st.warning("Please select two different teams.")
-
