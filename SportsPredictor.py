@@ -259,9 +259,10 @@ if home_team != away_team:
         home_stats = team_stats[team_stats["Team"] == home_team][selected_raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][selected_raw_features].values[0]
         diff_vector = home_stats - away_stats
+        clipped_vector = np.clip(diff_vector, -0.005, 0.005)  # Clamp stat diffs
 
         # Scale and append home field indicator
-        diff_scaled = scaler.transform([diff_vector])[0]
+        diff_scaled = scaler.transform([clipped_vector])[0]
         final_vector = np.append(diff_scaled, 0.5)  # Neutral field
 
         # Predict
