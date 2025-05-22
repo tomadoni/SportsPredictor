@@ -187,7 +187,7 @@ else:
     st.warning("Please select two different teams.")
 
 
-# MLB Matchup Predictor App (Fixed for Training on Historical Data Only)
+# MLB Matchup Predictor App (Fully Error-Handled and Updated)
 
 import pandas as pd
 import numpy as np
@@ -200,19 +200,20 @@ from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log
 
 # --- Load Training Data ---
 matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
-team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")    # Updated combined team stats
+team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")  # Updated combined team stats
 
-# --- Define Selected Features ---
-selected_raw_features = ['OPS', 'AVG', 'OBP', 'SLG', 'R', 'ERA']
-diff_features = ['diff_' + f for f in selected_raw_features]
+# --- Define Selected Features (match actual available columns) ---
+selected_raw_features = ['OPS', 'AVG', 'OBP', 'SLG', 'R', 'ERA_x']
+diff_features = ['diff_OPS', 'diff_AVG', 'diff_OBP', 'diff_SLG', 'diff_R', 'diff_ERA']
 model_features = diff_features + ['home_indicator']
 
 # --- Prepare Feature Matrix and Labels ---
+matchup_df = matchup_df.dropna(subset=["Winner"])  # Ensure labeled data only
 X_stats = matchup_df[diff_features]
 X_home = matchup_df[['home_indicator']]
-y = matchup_df["Winner"].dropna()
+y = matchup_df["Winner"]
 
-# Align X with non-null y
+# Align X with y
 X_stats = X_stats.loc[y.index]
 X_home = X_home.loc[y.index]
 
@@ -254,6 +255,7 @@ with col2:
 
 if home_team != away_team:
     try:
+        # Use columns that exist in the CSV, such as ERA_x instead of ERA
         home_stats = team_stats[team_stats["Team"] == home_team][selected_raw_features].values[0]
         away_stats = team_stats[team_stats["Team"] == away_team][selected_raw_features].values[0]
         diff_vector = home_stats - away_stats
@@ -273,7 +275,8 @@ if home_team != away_team:
         st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
         st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
-    except IndexError:
-        st.error("Team stats not found.")
+    except Exception as e:
+        st.error(f"An error occurred during prediction: {e}")
 else:
     st.warning("Please select two different teams.")
+
