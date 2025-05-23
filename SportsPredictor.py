@@ -187,66 +187,59 @@ else:
     st.warning("Please select two different teams.")
 
 
-# MLB Matchup Predictor App (Fully Error-Handled and Updated)
+# MLB Matchup Predictor App (Streamlit Version with Real Team Names and Logistic Regression)
 
 import pandas as pd
 import numpy as np
 import streamlit as st
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import accuracy_score, roc_auc_score, brier_score_loss, log_loss
 
-# --- Load Training Data ---
-matchup_df = pd.read_csv("MLB_Matchup_Training_Data.csv")
-team_stats = pd.read_csv("MLB_Combined_Team_Stats.csv")  # Updated combined team stats
+# --- Load Cleaned Stats and Matchup Results ---
+stats = pd.read_csv("MLB_Run_Differential_Clean_FIXED.csv").apply(pd.to_numeric, errors='coerce').dropna()
+games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
 
-# --- Define Selected Features (match actual available columns) ---
-selected_raw_features = ['OPS', 'AVG', 'OBP', 'SLG', 'R', 'ERA_x']
-diff_features = ['diff_OPS', 'diff_AVG', 'diff_OBP', 'diff_SLG', 'diff_R', 'diff_ERA']
-model_features = diff_features + ['home_indicator']
+# --- Define MLB Teams ---
+teams = sorted(games["Home"].unique())
 
-# --- Prepare Feature Matrix and Labels ---
-matchup_df = matchup_df.dropna(subset=["Winner"])  # Ensure labeled data only
-X_stats = matchup_df[diff_features]
-X_home = matchup_df[['home_indicator']]
-y = matchup_df["Winner"]
+# --- Build Team Stats Table ---
+features = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
+home = stats[[f"home_{f}" for f in features]].copy()
+away = stats[[f"away_{f}" for f in features]].copy()
+home.columns = features
+away.columns = features
+all_team_stats = pd.concat([home, away], axis=0).reset_index(drop=True)
+team_stats = all_team_stats.groupby(all_team_stats.index % 30).mean()
+team_stats["Team"] = teams
+team_stats = team_stats.set_index("Team")
 
-# Align X with y
-X_stats = X_stats.loc[y.index]
-X_home = X_home.loc[y.index]
+# --- Prepare Training Data ---
+games["run_diff"] = games["Home Score"] - games["Away Score"]
+games["home_win"] = (games["run_diff"] > 0).astype(int)
 
-# --- Scale stat features only ---
+rows = []
+for _, row in games.iterrows():
+    try:
+        h = team_stats.loc[row["Home"]]
+        a = team_stats.loc[row["Away"]]
+        diff = [h[f] - a[f] for f in features]
+        rows.append(diff + [row["home_win"]])
+    except:
+        continue
+
+df_model = pd.DataFrame(rows, columns=["diff_" + f for f in features] + ["home_win"])
+
+X = df_model.drop(columns="home_win")
+y = df_model["home_win"]
 scaler = StandardScaler()
-X_stats_scaled = scaler.fit_transform(X_stats)
-
-# --- Combine with unscaled home indicator ---
-X_combined = np.hstack([X_stats_scaled, X_home.values])
-
-# --- Train/Test Split ---
-X_train, X_test, y_train, y_test = train_test_split(
-    X_combined, y, test_size=0.2, random_state=42, stratify=y
-)
-
-# --- Train Random Forest with Calibration ---
-rf = RandomForestClassifier(n_estimators=500, max_depth=10, random_state=42)
-model = CalibratedClassifierCV(estimator=rf, method='sigmoid', cv=5)
-model.fit(X_train, y_train)
-
-# --- Evaluation ---
-y_pred_test = model.predict(X_test)
-probs_test = model.predict_proba(X_test)[:, 1]
-acc = accuracy_score(y_test, y_pred_test)
-auc = roc_auc_score(y_test, probs_test)
-brier = brier_score_loss(y_test, probs_test)
-logloss = log_loss(y_test, model.predict_proba(X_test))
+X_scaled = scaler.fit_transform(X)
+model = LogisticRegression(max_iter=1000)
+model.fit(X_scaled, y)
 
 # --- Streamlit App ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using top predictive features and Random Forest classifier.")
+st.markdown("Predict MLB matchups using real team stats and Logistic Regression model.")
 
-teams = sorted(team_stats["Team"].unique())
 col1, col2 = st.columns(2)
 with col1:
     home_team = st.selectbox("🏠 Home Team", teams)
@@ -255,29 +248,23 @@ with col2:
 
 if home_team != away_team:
     try:
-        # Use columns that exist in the CSV, such as ERA_x instead of ERA
-        home_stats = team_stats[team_stats["Team"] == home_team][selected_raw_features].values[0]
-        away_stats = team_stats[team_stats["Team"] == away_team][selected_raw_features].values[0]
-        diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -4.5, 4.5)  # Clamp stat diffs
-
-        # Scale and append home field indicator
-        diff_scaled = scaler.transform([clipped_vector])[0]
-        final_vector = np.append(diff_scaled, 0.5)  # Neutral field
-
-        # Predict
-        probs = model.predict_proba([final_vector])[0]
-        prob_home = probs[1]
-        prob_away = probs[0]
-        predicted_winner = home_team if prob_home > prob_away else away_team
+        h = team_stats.loc[home_team]
+        a = team_stats.loc[away_team]
+        diff_vector = np.array([h[f] - a[f] for f in features])
+        clipped_vector = np.clip(diff_vector, -5, 5)
+        scaled_vector = scaler.transform([clipped_vector])[0]
+        prob = model.predict_proba([scaled_vector])[0][1]
+        prob_home = prob
+        prob_away = 1 - prob
+        predicted = home_team if prob_home > prob_away else away_team
 
         st.subheader("📈 Prediction")
-        st.success(f"**Predicted Winner: {predicted_winner}**")
+        st.success(f"**Predicted Winner: {predicted}**")
         st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
         st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
     except Exception as e:
-        st.error(f"An error occurred during prediction: {e}")
+        st.error(f"An error occurred: {e}")
 else:
     st.warning("Please select two different teams.")
 
