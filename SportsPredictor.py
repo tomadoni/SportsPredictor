@@ -228,7 +228,7 @@ for _, row in games.iterrows():
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
         rows.append(diff + [-3.0])  # ⬅️ FLIPPED home_indicator
-        labels.append(row["home_win"])
+        labels.append(1 - row["home_win"])  # ✅ Flip the labels
     except:
         continue
 
