@@ -187,7 +187,7 @@ else:
     st.warning("Please select two different teams.")
 
 
-# MLB Matchup Predictor App (Streamlit Version with Real Team Names and Logistic Regression)
+# MLB Matchup Predictor App (Corrected for Home Indicator Bias)
 
 import pandas as pd
 import numpy as np
@@ -218,27 +218,34 @@ games["run_diff"] = games["Home Score"] - games["Away Score"]
 games["home_win"] = (games["run_diff"] > 0).astype(int)
 
 rows = []
+labels = []
 for _, row in games.iterrows():
     try:
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [row["home_win"]])
+        rows.append(diff + [1])  # home_indicator = 1
+        labels.append(row["home_win"])
     except:
         continue
 
-df_model = pd.DataFrame(rows, columns=["diff_" + f for f in features] + ["home_win"])
+columns = ["diff_" + f for f in features] + ["home_indicator"]
+df_model = pd.DataFrame(rows, columns=columns)
+df_model["home_win"] = labels
 
+# --- Train Model ---
 X = df_model.drop(columns="home_win")
 y = df_model["home_win"]
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+X_scaled = scaler.fit_transform(X.drop(columns=["home_indicator"]))
+X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
+
 model = LogisticRegression(max_iter=1000)
-model.fit(X_scaled, y)
+model.fit(X_final, y)
 
 # --- Streamlit App ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using real team stats and Logistic Regression model.")
+st.markdown("Predict MLB matchups using real team stats and a corrected Logistic Regression model.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -253,9 +260,10 @@ if home_team != away_team:
         diff_vector = np.array([h[f] - a[f] for f in features])
         clipped_vector = np.clip(diff_vector, -5, 5)
         scaled_vector = scaler.transform([clipped_vector])[0]
-        prob = model.predict_proba([scaled_vector])[0][1]
-        prob_home = prob
-        prob_away = 1 - prob
+        final_vector = np.append(scaled_vector, 1)  # home_indicator = 1
+
+        prob_home = model.predict_proba([final_vector])[0][1]
+        prob_away = 1 - prob_home
         predicted = home_team if prob_home > prob_away else away_team
 
         st.subheader("📈 Prediction")
@@ -264,7 +272,7 @@ if home_team != away_team:
         st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f"❌ An error occurred: {e}")
 else:
     st.warning("Please select two different teams.")
 
