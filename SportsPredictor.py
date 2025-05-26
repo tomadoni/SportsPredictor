@@ -198,11 +198,14 @@ stats = pd.read_csv("MLB_Run_Differential_Clean_FIXED.csv").apply(pd.to_numeric,
 games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
 pitchers = pd.read_csv("Cleaned_Pitcher_Stats.csv")
 
-# --- Define Features ---
+# --- Confirm pitcher columns ---
+# st.write(pitchers.columns.tolist())
+
+# --- Features ---
 features = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
 teams = sorted(games["Home"].unique())
 
-# --- Build Per-Team Stats ---
+# --- Build Team Stats ---
 stat_rows = []
 for i in range(len(stats)):
     try:
@@ -226,7 +229,7 @@ for _, row in games.iterrows():
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [-0.3])  # home_indicator
+        rows.append(diff + [-0.3])  # Home indicator baseline
         labels.append(row["home_win"])
     except:
         continue
@@ -235,7 +238,7 @@ diff_features = [f"diff_{f}" for f in features]
 df_model = pd.DataFrame(rows, columns=diff_features + ["home_indicator"])
 df_model["home_win"] = labels
 
-# --- Train Model ---
+# --- Train Logistic Regression Model ---
 X = df_model.drop(columns="home_win")
 y = df_model["home_win"]
 scaler = StandardScaler()
@@ -255,9 +258,9 @@ with col2:
     away_team = st.selectbox("✈️ Away Team", teams)
 
 if home_team != away_team:
-    # ✅ Filter pitcher dropdowns by actual Team column match
-    home_pitchers = pitchers[pitchers["Team"] == home_team]["Name"].tolist()
-    away_pitchers = pitchers[pitchers["Team"] == away_team]["Name"].tolist()
+    # Dynamically show only relevant pitchers
+    home_pitchers = pitchers[pitchers["Tm"] == home_team]["Name"].tolist()
+    away_pitchers = pitchers[pitchers["Tm"] == away_team]["Name"].tolist()
 
     col3, col4 = st.columns(2)
     with col3:
@@ -266,14 +269,14 @@ if home_team != away_team:
         away_pitcher = st.selectbox("🎯 Away Pitcher", away_pitchers)
 
     try:
-        # Team stat diff
+        # --- Team stat diff ---
         h = team_stats.loc[home_team]
         a = team_stats.loc[away_team]
         diff = np.array([h[f] - a[f] for f in features])
         clipped = np.clip(diff, -3, 3)
         scaled = scaler.transform([clipped])[0]
 
-        # ✅ Pitcher influence (lower ERA/WHIP = better, higher K/9 = better)
+        # --- Pitcher influence ---
         h_p = pitchers[pitchers["Name"] == home_pitcher].iloc[0]
         a_p = pitchers[pitchers["Name"] == away_pitcher].iloc[0]
 
@@ -282,13 +285,15 @@ if home_team != away_team:
             (h_p["K/9"] - a_p["K/9"]) * 0.3 +
             (a_p["WHIP"] - h_p["WHIP"]) * 0.2
         )
-        home_indicator = -0.3 + pitcher_score  # Adjust baseline home edge
+        home_indicator = -0.3 + pitcher_score
 
+        # --- Predict ---
         final_input = np.append(scaled, home_indicator)
         prob = model.predict_proba([final_input])[0]
         prob_home, prob_away = prob[1], prob[0]
         winner = home_team if prob_home > prob_away else away_team
 
+        # --- Display Results ---
         st.subheader("📈 Prediction")
         st.success(f"**Predicted Winner: {winner}**")
         st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
