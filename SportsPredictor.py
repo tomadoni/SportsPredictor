@@ -192,13 +192,13 @@ import numpy as np
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
 
 # --- Load Data ---
 stats = pd.read_csv("MLB_Run_Differential_Clean_FIXED.csv").apply(pd.to_numeric, errors='coerce').dropna()
 games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
+pitchers = pd.read_csv("Pitcher_Stats.csv")
 
-# --- Define Features and Teams ---
+# --- Define Features ---
 features = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
 teams = sorted(games["Home"].unique())
 
@@ -220,14 +220,13 @@ team_stats = df_team_stats.groupby("Team").mean()
 
 # --- Build Training Data ---
 games["home_win"] = (games["Home Score"] > games["Away Score"]).astype(int)
-
 rows, labels = [], []
 for _, row in games.iterrows():
     try:
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [-0.3])  # ✅ Apply mild home boost (reversed for this data)
+        rows.append(diff + [-0.3])  # home_indicator
         labels.append(row["home_win"])
     except:
         continue
@@ -242,13 +241,12 @@ y = df_model["home_win"]
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X.drop(columns=["home_indicator"]))
 X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
-
-model = LogisticRegression(max_iter=1000, class_weight="balanced")  # ✅ Auto-balance classes
+model = LogisticRegression(max_iter=1000, class_weight="balanced")
 model.fit(X_final, y)
 
-# --- Streamlit App UI ---
+# --- Streamlit UI ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using real team stats and a calibrated logistic model.")
+st.markdown("Predict MLB matchups using team stats and pitcher influence.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -257,14 +255,38 @@ with col2:
     away_team = st.selectbox("✈️ Away Team", teams)
 
 if home_team != away_team:
+    # Filter pitchers by team
+    home_pitchers = pitchers[pitchers["Team"] == home_team]["Name"].tolist()
+    away_pitchers = pitchers[pitchers["Team"] == away_team]["Name"].tolist()
+
+    col3, col4 = st.columns(2)
+    with col3:
+        home_pitcher = st.selectbox("🎯 Home Pitcher", home_pitchers)
+    with col4:
+        away_pitcher = st.selectbox("🎯 Away Pitcher", away_pitchers)
+
     try:
+        # Team stat diff
         h = team_stats.loc[home_team]
         a = team_stats.loc[away_team]
         diff = np.array([h[f] - a[f] for f in features])
         clipped = np.clip(diff, -3, 3)
         scaled = scaler.transform([clipped])[0]
-        final_input = np.append(scaled, [-0.3])  # ✅ match training signal
 
+        # Pitcher influence (lower ERA/WHIP = better, higher K/9 = better)
+        h_p = pitchers[pitchers["Name"] == home_pitcher].iloc[0]
+        a_p = pitchers[pitchers["Name"] == away_pitcher].iloc[0]
+
+        # Basic influence score
+        pitcher_score = (
+            (a_p["ERA"] - h_p["ERA"]) * 0.5 +
+            (h_p["K/9"] - a_p["K/9"]) * 0.3 +
+            (a_p["WHIP"] - h_p["WHIP"]) * 0.2
+        )
+        home_indicator = -0.3 + pitcher_score  # adjust baseline home advantage
+
+        # Predict
+        final_input = np.append(scaled, home_indicator)
         prob = model.predict_proba([final_input])[0]
         prob_home, prob_away = prob[1], prob[0]
         winner = home_team if prob_home > prob_away else away_team
@@ -273,9 +295,8 @@ if home_team != away_team:
         st.success(f"**Predicted Winner: {winner}**")
         st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
         st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
-    except:
-        st.error("❌ Could not find team stats.")
+    except Exception as e:
+        st.error(f"❌ Could not calculate prediction: {e}")
 else:
     st.warning("Please select two different teams.")
-
 
