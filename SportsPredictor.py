@@ -227,7 +227,7 @@ for _, row in games.iterrows():
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [0.3])  # ✅ Smaller home boost
+        rows.append(diff + [-0.3])  # ✅ Apply mild home boost (reversed for this data)
         labels.append(row["home_win"])
     except:
         continue
@@ -243,17 +243,24 @@ scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X.drop(columns=["home_indicator"]))
 X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
 
-model = LogisticRegression(max_iter=1000)
+model = LogisticRegression(max_iter=1000, class_weight="balanced")  # ✅ Auto-balance classes
 model.fit(X_final, y)
 
-# --- Streamlit App ---
-st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using stat differentials and calibrated home field impact.")
+# --- DEBUG INFO ---
+st.subheader("🔍 Model Diagnostic")
+st.write("🏠 Home win rate:", round(df_model["home_win"].mean(), 3))
+st.write("📉 Learned weight for home_indicator:", round(model.coef_[0][-1], 4))
 
-# 🔍 Histogram Debug Plot
-X_debug = scaler.transform(X.drop(columns=["home_indicator"]))
-X_debug_final = np.hstack([X_debug, X["home_indicator"].values.reshape(-1, 1)])
-probs = model.predict_proba(X_debug_final)[:, 1]
+# Compare predicted prob when home wins vs loses
+X_check = pd.DataFrame(X_final)
+X_check["y"] = y.values
+avg_win = model.predict_proba(X_final)[y == 1][:, 1].mean()
+avg_loss = model.predict_proba(X_final)[y == 0][:, 1].mean()
+st.write("✅ Avg prob when home team actually won:", round(avg_win, 3))
+st.write("❌ Avg prob when home team actually lost:", round(avg_loss, 3))
+
+# --- Histogram ---
+probs = model.predict_proba(X_final)[:, 1]
 fig, ax = plt.subplots()
 ax.hist(probs, bins=30, color="skyblue")
 ax.set_title("🏠 Predicted Home Win Probabilities")
@@ -261,7 +268,10 @@ ax.set_xlabel("Probability")
 ax.set_ylabel("Games")
 st.pyplot(fig)
 
-# --- UI ---
+# --- Streamlit App UI ---
+st.title("⚾ MLB Matchup Predictor")
+st.markdown("Predict MLB matchups using real team stats and a calibrated logistic model.")
+
 col1, col2 = st.columns(2)
 with col1:
     home_team = st.selectbox("🏠 Home Team", teams)
@@ -275,7 +285,7 @@ if home_team != away_team:
         diff = np.array([h[f] - a[f] for f in features])
         clipped = np.clip(diff, -5, 5)
         scaled = scaler.transform([clipped])[0]
-        final_input = np.append(scaled, [0.3])  # ✅ Consistent with training
+        final_input = np.append(scaled, [-0.3])  # ✅ match training signal
 
         prob = model.predict_proba([final_input])[0]
         prob_home, prob_away = prob[1], prob[0]
@@ -285,9 +295,9 @@ if home_team != away_team:
         st.success(f"**Predicted Winner: {winner}**")
         st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
         st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
-
     except:
         st.error("❌ Could not find team stats.")
 else:
     st.warning("Please select two different teams.")
+
 
