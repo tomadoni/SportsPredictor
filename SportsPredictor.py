@@ -283,7 +283,7 @@ if home_team != away_team:
         h = team_stats.loc[home_team]
         a = team_stats.loc[away_team]
         diff = np.array([h[f] - a[f] for f in features])
-        clipped = np.clip(diff, -2, 2)
+        clipped = np.clip(diff, -1, 1)
         scaled = scaler.transform([clipped])[0]
         final_input = np.append(scaled, [-0.3])  # ✅ match training signal
 
