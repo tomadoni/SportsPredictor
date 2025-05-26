@@ -259,15 +259,6 @@ avg_loss = model.predict_proba(X_final)[y == 0][:, 1].mean()
 st.write("✅ Avg prob when home team actually won:", round(avg_win, 3))
 st.write("❌ Avg prob when home team actually lost:", round(avg_loss, 3))
 
-# --- Histogram ---
-probs = model.predict_proba(X_final)[:, 1]
-fig, ax = plt.subplots()
-ax.hist(probs, bins=30, color="skyblue")
-ax.set_title("🏠 Predicted Home Win Probabilities")
-ax.set_xlabel("Probability")
-ax.set_ylabel("Games")
-st.pyplot(fig)
-
 # --- Streamlit App UI ---
 st.title("⚾ MLB Matchup Predictor")
 st.markdown("Predict MLB matchups using real team stats and a calibrated logistic model.")
