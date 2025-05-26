@@ -246,19 +246,6 @@ X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
 model = LogisticRegression(max_iter=1000, class_weight="balanced")  # ✅ Auto-balance classes
 model.fit(X_final, y)
 
-# --- DEBUG INFO ---
-st.subheader("🔍 Model Diagnostic")
-st.write("🏠 Home win rate:", round(df_model["home_win"].mean(), 3))
-st.write("📉 Learned weight for home_indicator:", round(model.coef_[0][-1], 4))
-
-# Compare predicted prob when home wins vs loses
-X_check = pd.DataFrame(X_final)
-X_check["y"] = y.values
-avg_win = model.predict_proba(X_final)[y == 1][:, 1].mean()
-avg_loss = model.predict_proba(X_final)[y == 0][:, 1].mean()
-st.write("✅ Avg prob when home team actually won:", round(avg_win, 3))
-st.write("❌ Avg prob when home team actually lost:", round(avg_loss, 3))
-
 # --- Streamlit App UI ---
 st.title("⚾ MLB Matchup Predictor")
 st.markdown("Predict MLB matchups using real team stats and a calibrated logistic model.")
