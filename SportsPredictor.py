@@ -201,15 +201,21 @@ games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
 features = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
 teams = sorted(games["Home"].unique())
 
-# --- Build Team Stat Table ---
-home = stats[[f"home_{f}" for f in features]].copy()
-away = stats[[f"away_{f}" for f in features]].copy()
-home.columns = features
-away.columns = features
-all_stats = pd.concat([home, away], axis=0).reset_index(drop=True)
-team_stats = all_stats.groupby(all_stats.index % 30).mean()
-team_stats["Team"] = teams
-team_stats = team_stats.set_index("Team")
+# --- Build REAL Per-Team Stat Table ---
+stat_rows = []
+for i in range(len(stats)):
+    try:
+        home_team = games.iloc[i]["Home"]
+        away_team = games.iloc[i]["Away"]
+        home_vals = [stats.iloc[i][f"home_{f}"] for f in features]
+        away_vals = [stats.iloc[i][f"away_{f}"] for f in features]
+        stat_rows.append((home_team, home_vals))
+        stat_rows.append((away_team, away_vals))
+    except:
+        continue
+
+df_team_stats = pd.DataFrame(stat_rows, columns=["Team", features])
+team_stats = df_team_stats.groupby("Team").mean()
 
 # --- Build Training Data ---
 games["home_win"] = (games["Home Score"] > games["Away Score"]).astype(int)
@@ -239,9 +245,9 @@ X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
 model = LogisticRegression(max_iter=1000)
 model.fit(X_final, y)
 
-# --- Streamlit App ---
+# --- Streamlit UI ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using stat differentials and properly tuned home field effect.")
+st.markdown("Predict MLB matchups using real per-team stats and logistic regression.")
 
 col1, col2 = st.columns(2)
 with col1:
