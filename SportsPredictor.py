@@ -209,12 +209,12 @@ for i in range(len(stats)):
         away_team = games.iloc[i]["Away"]
         home_vals = [stats.iloc[i][f"home_{f}"] for f in features]
         away_vals = [stats.iloc[i][f"away_{f}"] for f in features]
-        stat_rows.append((home_team, home_vals))
-        stat_rows.append((away_team, away_vals))
+        stat_rows.append([home_team] + home_vals)
+        stat_rows.append([away_team] + away_vals)
     except:
         continue
 
-df_team_stats = pd.DataFrame(stat_rows, columns=["Team", features])
+df_team_stats = pd.DataFrame(stat_rows, columns=["Team"] + features)
 team_stats = df_team_stats.groupby("Team").mean()
 
 # --- Build Training Data ---
@@ -277,3 +277,4 @@ if home_team != away_team:
         st.error("❌ Could not find team stats.")
 else:
     st.warning("Please select two different teams.")
+
