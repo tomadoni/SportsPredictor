@@ -192,6 +192,7 @@ import numpy as np
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 
 # --- Load Data ---
 stats = pd.read_csv("MLB_Run_Differential_Clean_FIXED.csv").apply(pd.to_numeric, errors='coerce').dropna()
@@ -201,7 +202,7 @@ games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
 features = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
 teams = sorted(games["Home"].unique())
 
-# --- Build REAL Per-Team Stat Table ---
+# --- Build Per-Team Stats ---
 stat_rows = []
 for i in range(len(stats)):
     try:
@@ -226,7 +227,7 @@ for _, row in games.iterrows():
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [3.0])  # ✅ home_indicator = +3
+        rows.append(diff + [-3.0])  # ⬅️ FLIPPED home_indicator
         labels.append(row["home_win"])
     except:
         continue
@@ -247,8 +248,20 @@ model.fit(X_final, y)
 
 # --- Streamlit UI ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using real per-team stats and logistic regression.")
+st.markdown("Predict MLB matchups using team stats and adjusted home field learning.")
 
+# Debug chart
+X_debug = scaler.transform(X.drop(columns=["home_indicator"]))
+X_debug_final = np.hstack([X_debug, X["home_indicator"].values.reshape(-1, 1)])
+probs = model.predict_proba(X_debug_final)[:, 1]
+fig, ax = plt.subplots()
+ax.hist(probs, bins=30, color="skyblue")
+ax.set_title("🏠 Predicted Home Win Probabilities")
+ax.set_xlabel("Probability")
+ax.set_ylabel("Games")
+st.pyplot(fig)
+
+# --- Prediction UI ---
 col1, col2 = st.columns(2)
 with col1:
     home_team = st.selectbox("🏠 Home Team", teams)
@@ -262,7 +275,7 @@ if home_team != away_team:
         diff = np.array([h[f] - a[f] for f in features])
         clipped = np.clip(diff, -5, 5)
         scaled = scaler.transform([clipped])[0]
-        final_input = np.append(scaled, [3])  # ✅ match training logic
+        final_input = np.append(scaled, [-3])  # ⬅️ FLIPPED here too
 
         prob = model.predict_proba([final_input])[0]
         prob_home, prob_away = prob[1], prob[0]
