@@ -227,8 +227,8 @@ for _, row in games.iterrows():
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [-3.0])  # ⬅️ FLIPPED home_indicator
-        labels.append(1 - row["home_win"])  # ✅ Flip the labels
+        rows.append(diff + [0.3])  # ✅ Smaller home boost
+        labels.append(row["home_win"])
     except:
         continue
 
@@ -246,11 +246,11 @@ X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
 model = LogisticRegression(max_iter=1000)
 model.fit(X_final, y)
 
-# --- Streamlit UI ---
+# --- Streamlit App ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using team stats and adjusted home field learning.")
+st.markdown("Predict MLB matchups using stat differentials and calibrated home field impact.")
 
-# Debug chart
+# 🔍 Histogram Debug Plot
 X_debug = scaler.transform(X.drop(columns=["home_indicator"]))
 X_debug_final = np.hstack([X_debug, X["home_indicator"].values.reshape(-1, 1)])
 probs = model.predict_proba(X_debug_final)[:, 1]
@@ -261,7 +261,7 @@ ax.set_xlabel("Probability")
 ax.set_ylabel("Games")
 st.pyplot(fig)
 
-# --- Prediction UI ---
+# --- UI ---
 col1, col2 = st.columns(2)
 with col1:
     home_team = st.selectbox("🏠 Home Team", teams)
@@ -275,7 +275,7 @@ if home_team != away_team:
         diff = np.array([h[f] - a[f] for f in features])
         clipped = np.clip(diff, -5, 5)
         scaled = scaler.transform([clipped])[0]
-        final_input = np.append(scaled, [-3])  # ⬅️ FLIPPED here too
+        final_input = np.append(scaled, [0.3])  # ✅ Consistent with training
 
         prob = model.predict_proba([final_input])[0]
         prob_home, prob_away = prob[1], prob[0]
