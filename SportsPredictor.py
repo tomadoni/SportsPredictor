@@ -220,7 +220,7 @@ for _, row in games.iterrows():
         h = team_stats.loc[row["Home"]]
         a = team_stats.loc[row["Away"]]
         diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [-3.0])  # amplify home field like NBA/NHL
+        rows.append(diff + [3.0])  # ✅ home_indicator = +3
         labels.append(row["home_win"])
     except:
         continue
@@ -229,7 +229,7 @@ diff_features = [f"diff_{f}" for f in features]
 df_model = pd.DataFrame(rows, columns=diff_features + ["home_indicator"])
 df_model["home_win"] = labels
 
-# --- Model Training ---
+# --- Train Model ---
 X = df_model.drop(columns="home_win")
 y = df_model["home_win"]
 scaler = StandardScaler()
@@ -239,9 +239,9 @@ X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
 model = LogisticRegression(max_iter=1000)
 model.fit(X_final, y)
 
-# --- Streamlit App UI ---
+# --- Streamlit App ---
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using team stat differentials and exaggerated home field advantage.")
+st.markdown("Predict MLB matchups using stat differentials and properly tuned home field effect.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -253,10 +253,10 @@ if home_team != away_team:
     try:
         h = team_stats.loc[home_team]
         a = team_stats.loc[away_team]
-        diff = [h[f] - a[f] for f in features]
+        diff = np.array([h[f] - a[f] for f in features])
         clipped = np.clip(diff, -5, 5)
         scaled = scaler.transform([clipped])[0]
-        final_input = np.append(scaled, [-20])  # match your successful exaggeration
+        final_input = np.append(scaled, [3])  # ✅ match training logic
 
         prob = model.predict_proba([final_input])[0]
         prob_home, prob_away = prob[1], prob[0]
@@ -266,9 +266,8 @@ if home_team != away_team:
         st.success(f"**Predicted Winner: {winner}**")
         st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
         st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
+
     except:
-        st.error("Team stats not found.")
+        st.error("❌ Could not find team stats.")
 else:
     st.warning("Please select two different teams.")
-
-
