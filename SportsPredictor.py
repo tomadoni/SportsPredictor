@@ -192,14 +192,13 @@ import streamlit as st
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from scipy.special import expit  # for optional post-model logit tweak
-import matplotlib.pyplot as plt
 
 # =========================
 # Config
 # =========================
 FEATURES = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
 CLIP_MIN, CLIP_MAX = -3.0, 3.0
-HOME_LOGIT_BONUS = 0.0  # ← optional post-model home-field bump (log-odds). Try 0.15–0.25.
+HOME_LOGIT_BONUS_DEFAULT = 0.0  # Try 0.15–0.25 if you want a mild home boost
 
 # =========================
 # Load Data
@@ -211,12 +210,12 @@ stats = (
 )
 games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
 
-# Sanity: teams list (union of Home & Away)
+# Teams list: union of Home & Away
 teams = sorted(pd.unique(pd.concat([games["Home"], games["Away"]], ignore_index=True).dropna()))
 
 # =========================
 # Build Per-Team Stats (mean across rows)
-# Assumes stats rows align with games rows for home_/away_ feature columns.
+# Assumes stats rows align with games rows for home_/away_ columns.
 # =========================
 stat_rows = []
 n = min(len(stats), len(games))  # be defensive if files differ in length
@@ -227,7 +226,6 @@ for i in range(n):
         home_vals = [stats.iloc[i][f"home_{f}"] for f in FEATURES]
         away_vals = [stats.iloc[i][f"away_{f}"] for f in FEATURES]
     except KeyError:
-        # If expected columns are missing, skip this row
         continue
     stat_rows.append([home_team] + home_vals)
     stat_rows.append([away_team] + away_vals)
@@ -270,21 +268,20 @@ model.fit(X_scaled, y)
 # Streamlit UI
 # =========================
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using team stat differentials and a calibrated logistic model.")
+st.markdown("Predict MLB matchups using team stat differentials and a logistic model.")
 
 # Optional: expose a UI knob for home advantage (logit bump)
 HOME_LOGIT_BONUS = st.sidebar.slider(
-    "Optional Home Logit Bonus (advanced)",
+    "Optional Home Logit Bonus (log-odds)",
     min_value=0.0,
     max_value=0.5,
-    value=HOME_LOGIT_BONUS,
+    value=HOME_LOGIT_BONUS_DEFAULT,
     step=0.01,
-    help="Adds a small log-odds bump to the home team after the model prediction. 0.20 ≈ ~+5 pp near 50/50."
+    help="Adds a small log-odds bump to the home team after the model prediction. ~0.20 ≈ about +5 pp near 50/50."
 )
 
 # Show historical home win rate for sanity
-if "home_win" in games:
-    st.sidebar.metric("Historical Home Win Rate", f"{games['home_win'].mean()*100:.1f}%")
+st.sidebar.metric("Historical Home Win Rate", f"{games['home_win'].mean()*100:.1f}%")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -306,10 +303,7 @@ if home_team and away_team:
             clipped = np.clip(diff, CLIP_MIN, CLIP_MAX)
             scaled = scaler.transform([clipped])[0]
 
-            # Two options:
-            # (A) Direct probability
-            # prob_home = model.predict_proba([scaled])[0, 1]
-            # (B) Optional post-model home logit bump (for easy tuning)
+            # Use decision_function + optional logit bump
             home_logit = model.decision_function([scaled])[0]
             home_logit += HOME_LOGIT_BONUS
             prob_home = float(expit(home_logit))
@@ -322,5 +316,4 @@ if home_team and away_team:
             c1, c2 = st.columns(2)
             c1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
             c2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
-
 
