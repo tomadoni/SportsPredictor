@@ -191,90 +191,136 @@ import numpy as np
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from scipy.special import expit  # for optional post-model logit tweak
 import matplotlib.pyplot as plt
 
-# --- Load Data ---
-stats = pd.read_csv("MLB_Run_Differential_Clean_FIXED.csv").apply(pd.to_numeric, errors='coerce').dropna()
+# =========================
+# Config
+# =========================
+FEATURES = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
+CLIP_MIN, CLIP_MAX = -3.0, 3.0
+HOME_LOGIT_BONUS = 0.0  # ← optional post-model home-field bump (log-odds). Try 0.15–0.25.
+
+# =========================
+# Load Data
+# =========================
+stats = (
+    pd.read_csv("MLB_Run_Differential_Clean_FIXED.csv")
+    .apply(pd.to_numeric, errors="coerce")
+    .dropna()
+)
 games = pd.read_csv("mlb-2025-asplayed.csv", encoding="ISO-8859-1")
 
-# --- Define Features and Teams ---
-features = ["OPS", "OBP", "SLG", "ERA", "WHIP", "SO", "BB"]
-teams = sorted(games["Home"].unique())
+# Sanity: teams list (union of Home & Away)
+teams = sorted(pd.unique(pd.concat([games["Home"], games["Away"]], ignore_index=True).dropna()))
 
-# --- Build Per-Team Stats ---
+# =========================
+# Build Per-Team Stats (mean across rows)
+# Assumes stats rows align with games rows for home_/away_ feature columns.
+# =========================
 stat_rows = []
-for i in range(len(stats)):
+n = min(len(stats), len(games))  # be defensive if files differ in length
+for i in range(n):
+    home_team = games.iloc[i]["Home"]
+    away_team = games.iloc[i]["Away"]
     try:
-        home_team = games.iloc[i]["Home"]
-        away_team = games.iloc[i]["Away"]
-        home_vals = [stats.iloc[i][f"home_{f}"] for f in features]
-        away_vals = [stats.iloc[i][f"away_{f}"] for f in features]
-        stat_rows.append([home_team] + home_vals)
-        stat_rows.append([away_team] + away_vals)
-    except:
+        home_vals = [stats.iloc[i][f"home_{f}"] for f in FEATURES]
+        away_vals = [stats.iloc[i][f"away_{f}"] for f in FEATURES]
+    except KeyError:
+        # If expected columns are missing, skip this row
         continue
+    stat_rows.append([home_team] + home_vals)
+    stat_rows.append([away_team] + away_vals)
 
-df_team_stats = pd.DataFrame(stat_rows, columns=["Team"] + features)
-team_stats = df_team_stats.groupby("Team").mean()
+df_team_stats = pd.DataFrame(stat_rows, columns=["Team"] + FEATURES)
+team_stats = df_team_stats.groupby("Team", as_index=True).mean()
 
-# --- Build Training Data ---
+# =========================
+# Labels & Training Matrix
+# =========================
+games = games.copy()
 games["home_win"] = (games["Home Score"] > games["Away Score"]).astype(int)
 
 rows, labels = [], []
-for _, row in games.iterrows():
-    try:
-        h = team_stats.loc[row["Home"]]
-        a = team_stats.loc[row["Away"]]
-        diff = [h[f] - a[f] for f in features]
-        rows.append(diff + [-0.3])  # ✅ Apply mild home boost (reversed for this data)
-        labels.append(row["home_win"])
-    except:
+for _, g in games.iterrows():
+    home = g.get("Home")
+    away = g.get("Away")
+    if home not in team_stats.index or away not in team_stats.index:
         continue
+    h = team_stats.loc[home]
+    a = team_stats.loc[away]
+    diff = [h[f] - a[f] for f in FEATURES]  # home - away
+    rows.append(diff)
+    labels.append(g["home_win"])
 
-diff_features = [f"diff_{f}" for f in features]
-df_model = pd.DataFrame(rows, columns=diff_features + ["home_indicator"])
-df_model["home_win"] = labels
+diff_features = [f"diff_{f}" for f in FEATURES]
+df_model = pd.DataFrame(rows, columns=diff_features)
+y = pd.Series(labels, name="home_win")
 
-# --- Train Model ---
-X = df_model.drop(columns="home_win")
-y = df_model["home_win"]
+# Clip BEFORE fitting the scaler to keep train/serve consistent
+X_clipped = df_model.clip(lower=CLIP_MIN, upper=CLIP_MAX)
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X.drop(columns=["home_indicator"]))
-X_final = np.hstack([X_scaled, X["home_indicator"].values.reshape(-1, 1)])
+X_scaled = scaler.fit_transform(X_clipped.values)
 
-model = LogisticRegression(max_iter=1000, class_weight="balanced")  # ✅ Auto-balance classes
-model.fit(X_final, y)
+# Train model
+model = LogisticRegression(max_iter=1000, class_weight="balanced")
+model.fit(X_scaled, y)
 
-# --- Streamlit App UI ---
+# =========================
+# Streamlit UI
+# =========================
 st.title("⚾ MLB Matchup Predictor")
-st.markdown("Predict MLB matchups using real team stats and a calibrated logistic model.")
+st.markdown("Predict MLB matchups using team stat differentials and a calibrated logistic model.")
+
+# Optional: expose a UI knob for home advantage (logit bump)
+HOME_LOGIT_BONUS = st.sidebar.slider(
+    "Optional Home Logit Bonus (advanced)",
+    min_value=0.0,
+    max_value=0.5,
+    value=HOME_LOGIT_BONUS,
+    step=0.01,
+    help="Adds a small log-odds bump to the home team after the model prediction. 0.20 ≈ ~+5 pp near 50/50."
+)
+
+# Show historical home win rate for sanity
+if "home_win" in games:
+    st.sidebar.metric("Historical Home Win Rate", f"{games['home_win'].mean()*100:.1f}%")
 
 col1, col2 = st.columns(2)
 with col1:
-    home_team = st.selectbox("🏠 Home Team", teams)
+    home_team = st.selectbox("🏠 Home Team", teams, index=0 if teams else None)
 with col2:
-    away_team = st.selectbox("✈️ Away Team", teams)
+    away_team = st.selectbox("✈️ Away Team", teams, index=1 if len(teams) > 1 else None)
 
-if home_team != away_team:
-    try:
-        h = team_stats.loc[home_team]
-        a = team_stats.loc[away_team]
-        diff = np.array([h[f] - a[f] for f in features])
-        clipped = np.clip(diff, -3, 3)
-        scaled = scaler.transform([clipped])[0]
-        final_input = np.append(scaled, [-0.3])  # ✅ match training signal
+if home_team and away_team:
+    if home_team == away_team:
+        st.warning("Please select two different teams.")
+    else:
+        if home_team not in team_stats.index or away_team not in team_stats.index:
+            st.error("❌ Could not find team stats for one or both teams.")
+        else:
+            # Build feature vector (home - away), clip, scale
+            h = team_stats.loc[home_team]
+            a = team_stats.loc[away_team]
+            diff = np.array([h[f] - a[f] for f in FEATURES], dtype=float)
+            clipped = np.clip(diff, CLIP_MIN, CLIP_MAX)
+            scaled = scaler.transform([clipped])[0]
 
-        prob = model.predict_proba([final_input])[0]
-        prob_home, prob_away = prob[1], prob[0]
-        winner = home_team if prob_home > prob_away else away_team
+            # Two options:
+            # (A) Direct probability
+            # prob_home = model.predict_proba([scaled])[0, 1]
+            # (B) Optional post-model home logit bump (for easy tuning)
+            home_logit = model.decision_function([scaled])[0]
+            home_logit += HOME_LOGIT_BONUS
+            prob_home = float(expit(home_logit))
+            prob_away = 1.0 - prob_home
 
-        st.subheader("📈 Prediction")
-        st.success(f"**Predicted Winner: {winner}**")
-        st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
-        st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
-    except:
-        st.error("❌ Could not find team stats.")
-else:
-    st.warning("Please select two different teams.")
+            winner = home_team if prob_home >= prob_away else away_team
+
+            st.subheader("📈 Prediction")
+            st.success(f"**Predicted Winner: {winner}**")
+            c1, c2 = st.columns(2)
+            c1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
+            c2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
 
