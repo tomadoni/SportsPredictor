@@ -304,153 +304,191 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor (OFF vs DEF-allowed, stats-only)
+# 🏈 NFL Matchup Predictor — Calibrated RandomForest (best classifier)
 # =========================
 import pandas as pd
 import numpy as np
 import streamlit as st
-from scipy.special import expit
+import joblib
+from pathlib import Path
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, brier_score_loss
 
-# ---- Files (put them next to your app.py) ----
 NFL_OFFENSE_CSV = "NFL_Offense.csv"
 NFL_DEFENSE_CSV = "NFL_Defense.csv"
+NFL_GAMELOG_XLSX = "NFL Game log.xlsx"
+NFL_MODEL_PATH = "nfl_best_classifier.joblib"
+NFL_METRICS_CSV = "nfl_best_classifier_metrics.csv"
 
-# ---- Weights & scaling (tune as you like) ----
-WEIGHTS = {
-    "PTS_perG": 0.50,        # scoring matters most
-    "Pass_YDS_perG": 0.20,
-    "Rush_YDS_perG": 0.20,
-    "Tot_YDS_perG": 0.10,    # redundancy but helps stability early-season
-}
-LOGIT_SCALE = 1.25          # how sharp the logistic is
-HOME_LOGIT_BONUS = 0.15     # ≈ +3.7% near 50/50
+# ---------- Load OFF/DEF tables ----------
+off = pd.read_csv(NFL_OFFENSE_CSV)[["Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"]].copy()
+defn = pd.read_csv(NFL_DEFENSE_CSV)[["Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"]].copy()
 
-# ---- Load ----
-off = pd.read_csv(NFL_OFFENSE_CSV)
-defn = pd.read_csv(NFL_DEFENSE_CSV)
-
-# sanity: columns we need
-off_cols = ["Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"]
-def_cols = [
-    "Team",
-    "Tot_YDS_perG_Allowed",
-    "Pass_YDS_perG_Allowed",
-    "Rush_YDS_perG_Allowed",
-    "PTS_perG_Allowed",
-]
-off = off[off_cols].copy()
-defn = defn[def_cols].copy()
-
-# z-score helpers so metrics are comparable across categories
+# z-score contexts
 off_means = off.drop(columns=["Team"]).mean()
 off_stds  = off.drop(columns=["Team"]).std().replace(0, 1.0)
 def_means = defn.drop(columns=["Team"]).mean()
 def_stds  = defn.drop(columns=["Team"]).std().replace(0, 1.0)
 
-def z_off(row, col):  # offense per-G
-    return (row[col] - off_means[col]) / off_stds[col]
-
-def z_def(row, col):  # defense allowed per-G
-    return (row[col] - def_means[col]) / def_stds[col]
-
-# quick dicts for lookups
+# lookups
 off_d = {r.Team: r for _, r in off.iterrows()}
 def_d = {r.Team: r for _, r in defn.iterrows()}
-
 teams = sorted(set(off["Team"]).intersection(defn["Team"]))
 
-# ---- UI ----
-st.title("🏈 NFL Matchup Predictor")
-st.caption("Uses team offense per-game vs opponent defense per-game allowed. Early-season friendly.")
+def z_off(row, col):  # offense per-G
+    return (row[col] - off_means[col]) / off_stds[col]
+def inv_def(row, col_allowed):  # defense allowed: lower better -> invert
+    return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
+
+# ---------- Feature builder for any matchup ----------
+BASE_FEATURES = [
+    "edge_pts","edge_pass","edge_rush","edge_tot",
+    "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
+]
+EXTRA_FEATURES = ["edge_pass_minus_rush","edge_pts_combo","edge_tot_combo"]
+ALL_FEATURES = BASE_FEATURES + EXTRA_FEATURES
+
+def build_feature_dict(h_off, a_off, h_def, a_def):
+    x = {
+        "edge_pts":  z_off(h_off, "PTS_perG") - inv_def(a_def, "PTS_perG_Allowed"),
+        "edge_pass": z_off(h_off, "Pass_YDS_perG") - inv_def(a_def, "Pass_YDS_perG_Allowed"),
+        "edge_rush": z_off(h_off, "Rush_YDS_perG") - inv_def(a_def, "Rush_YDS_perG_Allowed"),
+        "edge_tot":  z_off(h_off, "Tot_YDS_perG")  - inv_def(a_def, "Tot_YDS_perG_Allowed"),
+        "edge_pts_def":  inv_def(h_def, "PTS_perG_Allowed") - z_off(a_off, "PTS_perG"),
+        "edge_pass_def": inv_def(h_def, "Pass_YDS_perG_Allowed") - z_off(a_off, "Pass_YDS_perG"),
+        "edge_rush_def": inv_def(h_def, "Rush_YDS_perG_Allowed") - z_off(a_off, "Rush_YDS_perG"),
+        "edge_tot_def":  inv_def(h_def, "Tot_YDS_perG_Allowed")  - z_off(a_off, "Tot_YDS_perG"),
+    }
+    x["edge_pass_minus_rush"] = x["edge_pass"] - x["edge_rush"]
+    x["edge_pts_combo"]       = x["edge_pts"]  + x["edge_pts_def"]
+    x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
+    return x
+
+# ---------- Train-or-load the best classifier ----------
+def load_or_train_classifier():
+    model_path = Path(NFL_MODEL_PATH)
+    if model_path.exists():
+        bundle = joblib.load(model_path)
+        return bundle["model"], bundle["feature_columns"], pd.read_csv(NFL_METRICS_CSV).iloc[0].to_dict() if Path(NFL_METRICS_CSV).exists() else None
+
+    # Train from game log (Sheet1). Uses nickname→full-name mapping to align with CSVs.
+    try:
+        gl = pd.read_excel(NFL_GAMELOG_XLSX, sheet_name="Sheet1")
+    except Exception:
+        st.warning("NFL model file not found and game log not available to train. Place 'nfl_best_classifier.joblib' or 'NFL Game log.xlsx' next to the app.")
+        return None, None, None
+
+    NAME_MAP = {
+        # NFC
+        "49ers":"San Francisco 49ers","Niners":"San Francisco 49ers","Bears":"Chicago Bears","Lions":"Detroit Lions",
+        "Packers":"Green Bay Packers","Vikings":"Minnesota Vikings","Cowboys":"Dallas Cowboys","Giants":"New York Giants",
+        "Eagles":"Philadelphia Eagles","Commanders":"Washington Commanders","Rams":"Los Angeles Rams","Seahawks":"Seattle Seahawks",
+        "Cardinals":"Arizona Cardinals","Saints":"New Orleans Saints","Buccaneers":"Tampa Bay Buccaneers","Bucs":"Tampa Bay Buccaneers",
+        "Falcons":"Atlanta Falcons","Panthers":"Carolina Panthers",
+        # AFC
+        "Bills":"Buffalo Bills","Dolphins":"Miami Dolphins","Patriots":"New England Patriots","Jets":"New York Jets",
+        "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cleveland Browns","Steelers":"Pittsburgh Steelers",
+        "Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars","Titans":"Tennessee Titans",
+        "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
+    }
+    gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+    gl["Away Team"] = gl["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+
+    rows = []
+    for _, g in gl.iterrows():
+        ht = str(g["Home Team"]).strip()
+        at = str(g["Away Team"]).strip()
+        if ht not in off_d or ht not in def_d or at not in off_d or at not in def_d:
+            continue
+        h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
+        x = build_feature_dict(h_off, a_off, h_def, a_def)
+        home_win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
+        rows.append({**x, "home_win": home_win})
+
+    feat = pd.DataFrame(rows)
+    if len(feat) < 25:
+        st.warning("Not enough rows from the game log to train the NFL model.")
+        return None, None, None
+
+    X = feat.drop(columns=["home_win"]).copy()
+    # ensure training feature order
+    feature_columns = ALL_FEATURES.copy()
+    X = X[feature_columns]
+    y = feat["home_win"].values
+
+    # Best classifier: RF + isotonic calibration
+    rf = RandomForestClassifier(
+        n_estimators=900,
+        max_features="sqrt",
+        min_samples_leaf=2,
+        random_state=42
+    )
+    model = CalibratedClassifierCV(rf, method="isotonic", cv=5)
+
+    # CV metrics
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    y_prob = cross_val_predict(model, X.values, y, cv=cv, method="predict_proba")[:,1]
+    y_hat  = (y_prob >= 0.5).astype(int)
+
+    metrics = {
+        "auc": float(roc_auc_score(y, y_prob)),
+        "log_loss": float(log_loss(y, y_prob)),
+        "brier": float(brier_score_loss(y, y_prob)),
+        "accuracy@0.5": float(accuracy_score(y, y_hat)),
+        # Heads-up: hard-label R² is not meaningful for classification, but we mirror your other models if desired:
+        # "r2_hard_labels": float(r2_score(y, y_hat)),
+        "n": int(len(y)),
+    }
+
+    # Fit on all data and save
+    model.fit(X.values, y)
+    joblib.dump({"model": model, "feature_columns": feature_columns}, NFL_MODEL_PATH)
+    pd.DataFrame([metrics]).to_csv(NFL_METRICS_CSV, index=False)
+
+    return model, feature_columns, metrics
+
+# Load/train once
+clf, feature_columns, cv_metrics = load_or_train_classifier()
+
+# ---------- Streamlit UI ----------
+st.title("🏈 NFL Matchup Predictor (Calibrated Random Forest)")
+st.caption("Trained on game outcomes with offense vs defense-allowed edges. Probabilities are isotonic-calibrated.")
 
 c1, c2 = st.columns(2)
 with c1:
-    home = st.selectbox("🏠 Home Team (NFL)", teams, index=0 if teams else None)
+    home_team = st.selectbox("🏠 Home Team (NFL)", teams, index=0 if teams else None)
 with c2:
-    away = st.selectbox("✈️ Away Team (NFL)", teams, index=1 if len(teams) > 1 else None)
+    away_team = st.selectbox("✈️ Away Team (NFL)", teams, index=1 if len(teams) > 1 else None)
 
-with st.expander("Advanced tuning", expanded=False):
-    LOGIT_SCALE = st.slider("Logit scale (higher = sharper)", 0.5, 3.0, LOGIT_SCALE, 0.05)
-    HOME_LOGIT_BONUS = st.slider("Home logit bonus", 0.00, 0.40, HOME_LOGIT_BONUS, 0.01)
-    w_pts = st.slider("Weight: PTS/G", 0.0, 1.0, WEIGHTS["PTS_perG"], 0.05)
-    w_pass = st.slider("Weight: Pass Yds/G", 0.0, 1.0, WEIGHTS["Pass_YDS_perG"], 0.05)
-    w_rush = st.slider("Weight: Rush Yds/G", 0.0, 1.0, WEIGHTS["Rush_YDS_perG"], 0.05)
-    w_tot = st.slider("Weight: Total Yds/G", 0.0, 1.0, WEIGHTS["Tot_YDS_perG"], 0.05)
-    s = w_pts + w_pass + w_rush + w_tot
-    if s == 0:
-        s = 1.0
-    WEIGHTS = {
-        "PTS_perG": w_pts / s,
-        "Pass_YDS_perG": w_pass / s,
-        "Rush_YDS_perG": w_rush / s,
-        "Tot_YDS_perG": w_tot / s,
-    }
-
-def matchup_probability(home_team: str, away_team: str) -> dict:
-    if home_team not in off_d or home_team not in def_d or away_team not in off_d or away_team not in def_d:
-        return {"error": "Missing team in OFF/DEF tables."}
-
-    h_off = off_d[home_team]
-    h_def = def_d[home_team]
-    a_off = off_d[away_team]
-    a_def = def_d[away_team]
-
-    # For each metric m, compute:
-    #   comp_m = ( z(h_off[m]) - z(a_def[m_allowed]) ) - ( z(a_off[m]) - z(h_def[m_allowed]) )
-    # Then take weighted sum.
-    comps = {}
-
-    comps["PTS_perG"] = (
-        z_off(h_off, "PTS_perG") - z_def(a_def, "PTS_perG_Allowed")
-        - (z_off(a_off, "PTS_perG") - z_def(h_def, "PTS_perG_Allowed"))
-    )
-
-    comps["Pass_YDS_perG"] = (
-        z_off(h_off, "Pass_YDS_perG") - z_def(a_def, "Pass_YDS_perG_Allowed")
-        - (z_off(a_off, "Pass_YDS_perG") - z_def(h_def, "Pass_YDS_perG_Allowed"))
-    )
-
-    comps["Rush_YDS_perG"] = (
-        z_off(h_off, "Rush_YDS_perG") - z_def(a_def, "Rush_YDS_perG_Allowed")
-        - (z_off(a_off, "Rush_YDS_perG") - z_def(h_def, "Rush_YDS_perG_Allowed"))
-    )
-
-    comps["Tot_YDS_perG"] = (
-        z_off(h_off, "Tot_YDS_perG") - z_def(a_def, "Tot_YDS_perG_Allowed")
-        - (z_off(a_off, "Tot_YDS_perG") - z_def(h_def, "Tot_YDS_perG_Allowed"))
-    )
-
-    score = sum(WEIGHTS[k] * comps[k] for k in WEIGHTS.keys())
-    logit = LOGIT_SCALE * score + HOME_LOGIT_BONUS
-    p_home = float(expit(logit))
-    return {
-        "prob_home": p_home,
-        "prob_away": 1 - p_home,
-        "components": comps,
-        "score": score,
-    }
-
-if home and away:
-    if home == away:
+if home_team and away_team:
+    if home_team == away_team:
         st.warning("Please select two different teams.")
+    elif home_team not in off_d or away_team not in off_d:
+        st.error("Could not find team stats.")
+    elif clf is None:
+        st.error("NFL classifier is not ready (missing model and not enough data to train).")
     else:
-        res = matchup_probability(home, away)
-        if "error" in res:
-            st.error(res["error"])
-        else:
-            prob_home = res["prob_home"]; prob_away = res["prob_away"]
-            winner = home if prob_home >= prob_away else away
+        h_off, a_off, h_def, a_def = off_d[home_team], off_d[away_team], def_d[home_team], def_d[away_team]
+        x = build_feature_dict(h_off, a_off, h_def, a_def)
+        vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
 
-            st.subheader("📈 Prediction")
-            st.success(f"**Predicted Winner: {winner}**")
-            c1, c2 = st.columns(2)
-            c1.metric(f"{home} Win Probability", f"{prob_home*100:.1f}%")
-            c2.metric(f"{away} Win Probability", f"{prob_away*100:.1f}%")
+        prob_home = float(clf.predict_proba(vec)[0, 1])
+        prob_away = 1.0 - prob_home
+        winner = home_team if prob_home >= prob_away else away_team
 
-            with st.expander("Why the model thinks this:", expanded=False):
-                st.write("Weighted component advantages (home-positive):")
-                for k, v in res["components"].items():
-                    st.write(f"- {k}: {v:+.3f}")
-                st.caption(f"Composite score: {res['score']:+.3f}  |  Scale={LOGIT_SCALE:.2f}, Home bonus={HOME_LOGIT_BONUS:.2f}")
+        st.subheader("📈 Prediction")
+        st.success(f"**Predicted Winner: {winner}**")
+        c3, c4 = st.columns(2)
+        c3.metric(f"{home_team} Win Probability", f"{prob_home*100:.1f}%")
+        c4.metric(f"{away_team} Win Probability", f"{prob_away*100:.1f}%")
 
+        with st.expander("Inputs used by the model"):
+            pretty = {k: f"{x[k]:+.3f}" for k in ALL_FEATURES}
+            st.json(pretty)
+
+        if cv_metrics:
+            with st.expander("Model CV metrics"):
+                st.write(cv_metrics)
 
