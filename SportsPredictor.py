@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — trains automatically if no saved model
+# 🏈 NFL Matchup Predictor — CSV-only, auto-trains if no saved model
 # =========================
 import os, glob
 import numpy as np
@@ -317,9 +317,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, brier_score_loss
 
-# ------------------------------------------------------------
-# Robust file finder (supports variants + optional data/ folder)
-# ------------------------------------------------------------
+# -------- file finder (supports data/ subfolder) --------
 def _find_one(possibles):
     for p in possibles:
         hits = glob.glob(p)
@@ -327,31 +325,27 @@ def _find_one(possibles):
             return hits[0]
     return None
 
-OFF_PATH = _find_one(["NFL_Offense.csv", "nfl_offense.csv", "data/NFL_Offense.csv", "data/nfl_offense.csv"])
-DEF_PATH = _find_one(["NFL_Defense.csv", "nfl_defense.csv", "data/NFL_Defense.csv", "data/nfl_defense.csv"])
-LOG_PATH = _find_one([
-    "NFL Game log.xlsx", "NFL_Game log.xlsx", "NFL_Game_log.xlsx",
-    "nfl game log.xlsx", "data/NFL Game log.xlsx", "data/NFL_Game log.xlsx", "data/NFL_Game_log.xlsx"
-])
+OFF_PATH = _find_one(["NFL_Offense.csv", "data/NFL_Offense.csv"])
+DEF_PATH = _find_one(["NFL_Defense.csv", "data/NFL_Defense.csv"])
+LOG_PATH = _find_one(["NFL_Game_log.csv", "data/NFL_Game_log.csv"])
+
 MODEL_PATH = Path("nfl_best_classifier.joblib")
 METRICS_CSV = Path("nfl_best_classifier_metrics.csv")
 
 st.caption(f"🗂 Working dir: `{os.getcwd()}`")
 st.caption(f"🔎 Offense CSV: `{OFF_PATH}`")
 st.caption(f"🔎 Defense CSV: `{DEF_PATH}`")
-st.caption(f"🔎 Game Log XLSX: `{LOG_PATH}`")
+st.caption(f"🔎 Game Log CSV: `{LOG_PATH}`")
 
-# ------------------------------------------------------------
-# Load data (with header validation)
-# ------------------------------------------------------------
+# -------- load CSVs with validation --------
 if not OFF_PATH or not DEF_PATH or not LOG_PATH:
-    st.error("Missing one or more files. Ensure these are in the app folder (or in `data/`): "
-             "`NFL_Offense.csv`, `NFL_Defense.csv`, `NFL Game log.xlsx`.")
+    st.error("Missing files. Ensure these exist (in app folder or `data/`): "
+             "`NFL_Offense.csv`, `NFL_Defense.csv`, `NFL_Game_log.csv`.")
     st.stop()
 
 off = pd.read_csv(OFF_PATH)
 defn = pd.read_csv(DEF_PATH)
-glog = pd.read_excel(LOG_PATH, sheet_name=0)
+glog = pd.read_csv(LOG_PATH)
 
 off_req = {"Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"}
 def_req = {"Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"}
@@ -360,7 +354,7 @@ log_req = {"Home Team","Away Team","Home Score","Away Score"}
 missing = []
 if not off_req.issubset(off.columns): missing.append(f"Offense CSV missing: {off_req - set(off.columns)}")
 if not def_req.issubset(defn.columns): missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
-if not log_req.issubset(glog.columns): missing.append(f"Game log missing: {log_req - set(glog.columns)}")
+if not log_req.issubset(glog.columns): missing.append(f"Game log CSV missing: {log_req - set(glog.columns)}")
 if missing:
     st.error("Column mismatch:\n- " + "\n- ".join(missing))
     with st.expander("Preview files"):
@@ -369,9 +363,7 @@ if missing:
         st.write("Game log head:", glog.head())
     st.stop()
 
-# ------------------------------------------------------------
-# Z-score contexts + lookups
-# ------------------------------------------------------------
+# -------- z-score contexts & lookups --------
 off_means = off.drop(columns=["Team"]).mean()
 off_stds  = off.drop(columns=["Team"]).std().replace(0, 1.0)
 def_means = defn.drop(columns=["Team"]).mean()
@@ -381,16 +373,13 @@ off_d = {r.Team: r for _, r in off.iterrows()}
 def_d = {r.Team: r for _, r in defn.iterrows()}
 teams = sorted(set(off["Team"]).intersection(defn["Team"]))
 
-def z_off(row, col):
+def z_off(row, col):  # offense per-G (higher = better)
     return (row[col] - off_means[col]) / off_stds[col]
 
-def inv_def(row, col_allowed):
-    # lower allowed => better defense; invert so higher=better
+def inv_def(row, col_allowed):  # defense allowed (lower = better) -> invert so higher is better
     return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
-# ------------------------------------------------------------
-# Feature engineering (same for training & inference)
-# ------------------------------------------------------------
+# -------- feature engineering --------
 BASE_FEATURES = [
     "edge_pts","edge_pass","edge_rush","edge_tot",
     "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
@@ -414,24 +403,20 @@ def build_feature_dict(h_off, a_off, h_def, a_def):
     x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
     return x
 
-# Nickname → full name mapping (for training from game log)
+# nickname → full team name (for training)
 NAME_MAP = {
-    # NFC
     "49ers":"San Francisco 49ers","Niners":"San Francisco 49ers","Bears":"Chicago Bears","Lions":"Detroit Lions",
     "Packers":"Green Bay Packers","Vikings":"Minnesota Vikings","Cowboys":"Dallas Cowboys","Giants":"New York Giants",
     "Eagles":"Philadelphia Eagles","Commanders":"Washington Commanders","Rams":"Los Angeles Rams","Seahawks":"Seattle Seahawks",
     "Cardinals":"Arizona Cardinals","Saints":"New Orleans Saints","Buccaneers":"Tampa Bay Buccaneers","Bucs":"Tampa Bay Buccaneers",
     "Falcons":"Atlanta Falcons","Panthers":"Carolina Panthers",
-    # AFC
     "Bills":"Buffalo Bills","Dolphins":"Miami Dolphins","Patriots":"New England Patriots","Jets":"New York Jets",
     "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cleveland Browns","Steelers":"Pittsburgh Steelers",
     "Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars","Titans":"Tennessee Titans",
     "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
 }
 
-# ------------------------------------------------------------
-# Train-or-load model (no separate training.py needed)
-# ------------------------------------------------------------
+# -------- train-or-load (no external training script) --------
 def train_from_gamelog():
     gl = glog.copy()
     gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
@@ -450,25 +435,22 @@ def train_from_gamelog():
 
     feat = pd.DataFrame(rows)
     if len(feat) < 25:
-        st.error("Not enough rows from the game log to train the NFL model. Check team names/scores in the log.")
+        st.error("Not enough rows from the game log to train the NFL model. Check team names/scores.")
         st.stop()
 
     X = feat.drop(columns=["home_win"]).copy()
-    X = X[ALL_FEATURES]  # enforce column order
+    X = X[ALL_FEATURES]
     y = feat["home_win"].values
 
     rf = RandomForestClassifier(
-        n_estimators=900,
-        max_features="sqrt",
-        min_samples_leaf=2,
-        random_state=42
+        n_estimators=900, max_features="sqrt", min_samples_leaf=2, random_state=42
     )
     model = CalibratedClassifierCV(rf, method="isotonic", cv=5)
 
-    # CV metrics
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     y_prob = cross_val_predict(model, X.values, y, cv=cv, method="predict_proba")[:, 1]
     y_hat  = (y_prob >= 0.5).astype(int)
+
     metrics = {
         "auc": float(roc_auc_score(y, y_prob)),
         "log_loss": float(log_loss(y, y_prob)),
@@ -477,7 +459,6 @@ def train_from_gamelog():
         "n": int(len(y)),
     }
 
-    # Fit on all data and save
     model.fit(X.values, y)
     joblib.dump({"model": model, "feature_columns": ALL_FEATURES}, MODEL_PATH)
     pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
@@ -493,11 +474,9 @@ def load_or_train():
 
 clf, cv_metrics = load_or_train()
 
-# ------------------------------------------------------------
-# Streamlit UI
-# ------------------------------------------------------------
-st.title("🏈 NFL Matchup Predictor (auto-trains if needed)")
-st.caption("Random Forest + isotonic calibration trained from your game log and team offense/defense stats.")
+# -------- Streamlit UI --------
+st.title("🏈 NFL Matchup Predictor (CSV-only, auto-trains)")
+st.caption("Random Forest + isotonic calibration trained from your game log and team OFF/DEF per-game stats.")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -531,5 +510,6 @@ if home_team and away_team:
         if cv_metrics:
             with st.expander("Model CV metrics"):
                 st.write(cv_metrics)
+
 
 
