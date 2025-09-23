@@ -301,3 +301,156 @@ if home_team and away_team:
         c1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
         c2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
+
+
+# =========================
+# 🏈 NFL Matchup Predictor (OFF vs DEF-allowed, stats-only)
+# =========================
+import pandas as pd
+import numpy as np
+import streamlit as st
+from scipy.special import expit
+
+# ---- Files (put them next to your app.py) ----
+NFL_OFFENSE_CSV = "NFL_Offense.csv"
+NFL_DEFENSE_CSV = "NFL_Defense.csv"
+
+# ---- Weights & scaling (tune as you like) ----
+WEIGHTS = {
+    "PTS_perG": 0.50,        # scoring matters most
+    "Pass_YDS_perG": 0.20,
+    "Rush_YDS_perG": 0.20,
+    "Tot_YDS_perG": 0.10,    # redundancy but helps stability early-season
+}
+LOGIT_SCALE = 1.25          # how sharp the logistic is
+HOME_LOGIT_BONUS = 0.15     # ≈ +3.7% near 50/50
+
+# ---- Load ----
+off = pd.read_csv(NFL_OFFENSE_CSV)
+defn = pd.read_csv(NFL_DEFENSE_CSV)
+
+# sanity: columns we need
+off_cols = ["Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"]
+def_cols = [
+    "Team",
+    "Tot_YDS_perG_Allowed",
+    "Pass_YDS_perG_Allowed",
+    "Rush_YDS_perG_Allowed",
+    "PTS_perG_Allowed",
+]
+off = off[off_cols].copy()
+defn = defn[def_cols].copy()
+
+# z-score helpers so metrics are comparable across categories
+off_means = off.drop(columns=["Team"]).mean()
+off_stds  = off.drop(columns=["Team"]).std().replace(0, 1.0)
+def_means = defn.drop(columns=["Team"]).mean()
+def_stds  = defn.drop(columns=["Team"]).std().replace(0, 1.0)
+
+def z_off(row, col):  # offense per-G
+    return (row[col] - off_means[col]) / off_stds[col]
+
+def z_def(row, col):  # defense allowed per-G
+    return (row[col] - def_means[col]) / def_stds[col]
+
+# quick dicts for lookups
+off_d = {r.Team: r for _, r in off.iterrows()}
+def_d = {r.Team: r for _, r in defn.iterrows()}
+
+teams = sorted(set(off["Team"]).intersection(defn["Team"]))
+
+# ---- UI ----
+st.title("🏈 NFL Matchup Predictor")
+st.caption("Uses team offense per-game vs opponent defense per-game allowed. Early-season friendly.")
+
+c1, c2 = st.columns(2)
+with c1:
+    home = st.selectbox("🏠 Home Team (NFL)", teams, index=0 if teams else None)
+with c2:
+    away = st.selectbox("✈️ Away Team (NFL)", teams, index=1 if len(teams) > 1 else None)
+
+with st.expander("Advanced tuning", expanded=False):
+    LOGIT_SCALE = st.slider("Logit scale (higher = sharper)", 0.5, 3.0, LOGIT_SCALE, 0.05)
+    HOME_LOGIT_BONUS = st.slider("Home logit bonus", 0.00, 0.40, HOME_LOGIT_BONUS, 0.01)
+    w_pts = st.slider("Weight: PTS/G", 0.0, 1.0, WEIGHTS["PTS_perG"], 0.05)
+    w_pass = st.slider("Weight: Pass Yds/G", 0.0, 1.0, WEIGHTS["Pass_YDS_perG"], 0.05)
+    w_rush = st.slider("Weight: Rush Yds/G", 0.0, 1.0, WEIGHTS["Rush_YDS_perG"], 0.05)
+    w_tot = st.slider("Weight: Total Yds/G", 0.0, 1.0, WEIGHTS["Tot_YDS_perG"], 0.05)
+    s = w_pts + w_pass + w_rush + w_tot
+    if s == 0:
+        s = 1.0
+    WEIGHTS = {
+        "PTS_perG": w_pts / s,
+        "Pass_YDS_perG": w_pass / s,
+        "Rush_YDS_perG": w_rush / s,
+        "Tot_YDS_perG": w_tot / s,
+    }
+
+def matchup_probability(home_team: str, away_team: str) -> dict:
+    if home_team not in off_d or home_team not in def_d or away_team not in off_d or away_team not in def_d:
+        return {"error": "Missing team in OFF/DEF tables."}
+
+    h_off = off_d[home_team]
+    h_def = def_d[home_team]
+    a_off = off_d[away_team]
+    a_def = def_d[away_team]
+
+    # For each metric m, compute:
+    #   comp_m = ( z(h_off[m]) - z(a_def[m_allowed]) ) - ( z(a_off[m]) - z(h_def[m_allowed]) )
+    # Then take weighted sum.
+    comps = {}
+
+    comps["PTS_perG"] = (
+        z_off(h_off, "PTS_perG") - z_def(a_def, "PTS_perG_Allowed")
+        - (z_off(a_off, "PTS_perG") - z_def(h_def, "PTS_perG_Allowed"))
+    )
+
+    comps["Pass_YDS_perG"] = (
+        z_off(h_off, "Pass_YDS_perG") - z_def(a_def, "Pass_YDS_perG_Allowed")
+        - (z_off(a_off, "Pass_YDS_perG") - z_def(h_def, "Pass_YDS_perG_Allowed"))
+    )
+
+    comps["Rush_YDS_perG"] = (
+        z_off(h_off, "Rush_YDS_perG") - z_def(a_def, "Rush_YDS_perG_Allowed")
+        - (z_off(a_off, "Rush_YDS_perG") - z_def(h_def, "Rush_YDS_perG_Allowed"))
+    )
+
+    comps["Tot_YDS_perG"] = (
+        z_off(h_off, "Tot_YDS_perG") - z_def(a_def, "Tot_YDS_perG_Allowed")
+        - (z_off(a_off, "Tot_YDS_perG") - z_def(h_def, "Tot_YDS_perG_Allowed"))
+    )
+
+    score = sum(WEIGHTS[k] * comps[k] for k in WEIGHTS.keys())
+    logit = LOGIT_SCALE * score + HOME_LOGIT_BONUS
+    p_home = float(expit(logit))
+    return {
+        "prob_home": p_home,
+        "prob_away": 1 - p_home,
+        "components": comps,
+        "score": score,
+    }
+
+if home and away:
+    if home == away:
+        st.warning("Please select two different teams.")
+    else:
+        res = matchup_probability(home, away)
+        if "error" in res:
+            st.error(res["error"])
+        else:
+            prob_home = res["prob_home"]; prob_away = res["prob_away"]
+            winner = home if prob_home >= prob_away else away
+
+            st.subheader("📈 Prediction")
+            st.success(f"**Predicted Winner: {winner}**")
+            c1, c2 = st.columns(2)
+            c1.metric(f"{home} Win Probability", f"{prob_home*100:.1f}%")
+            c2.metric(f"{away} Win Probability", f"{prob_away*100:.1f}%")
+
+            with st.expander("Why the model thinks this:", expanded=False):
+                st.write("Weighted component advantages (home-positive):")
+                for k, v in res["components"].items():
+                    st.write(f"- {k}: {v:+.3f}")
+                st.caption(f"Composite score: {res['score']:+.3f}  |  Scale={LOGIT_SCALE:.2f}, Home bonus={HOME_LOGIT_BONUS:.2f}")
+
+
