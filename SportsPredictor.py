@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, fast, calibrated, with probability clipping
+# 🏈 NFL Matchup Predictor — CSV-only, group-aware CV, calibrated, clipped
 # =========================
 import os, glob
 import numpy as np
@@ -312,7 +312,7 @@ import pandas as pd
 import streamlit as st
 import joblib
 from pathlib import Path
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import GroupKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, brier_score_loss
@@ -389,7 +389,7 @@ ALL_FEATURES = BASE_FEATURES + EXTRA_FEATURES
 
 def build_feature_dict(h_off, a_off, h_def, a_def):
     x = {
-        "edge_pts":  z_off(h_off, "PTS_perG") - inv_def(a_def, "PTS_perG_Allowed"),
+        "edge_pts":  z_off(h_off, "PTS_perG") - inv_def(a_def, "PTS_PERG_ALLOWED".lower().replace("perg","perG_Allowed").replace("pts_","PTS_")),
         "edge_pass": z_off(h_off, "Pass_YDS_perG") - inv_def(a_def, "Pass_YDS_perG_Allowed"),
         "edge_rush": z_off(h_off, "Rush_YDS_perG") - inv_def(a_def, "Rush_YDS_perG_Allowed"),
         "edge_tot":  z_off(h_off, "Tot_YDS_perG")  - inv_def(a_def, "Tot_YDS_perG_Allowed"),
@@ -416,11 +416,11 @@ NAME_MAP = {
     "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
 }
 
-# -------- fast CV with calibrated RF (no nested CV) --------
-def _oof_calibrated_proba(X, y, rf_params, n_splits=5, seed=42):
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+# -------- group-aware OOF with calibrated RF (no leakage by matchup) --------
+def _oof_calibrated_proba_grouped(X, y, groups, rf_params, n_splits=5, seed=42):
+    gkf = GroupKFold(n_splits=n_splits)
     oof = np.zeros(len(y), dtype=float)
-    for tr_idx, va_idx in skf.split(X, y):
+    for tr_idx, va_idx in gkf.split(X, y, groups):
         X_tr, X_va = X[tr_idx], X[va_idx]
         y_tr = y[tr_idx]
 
@@ -438,10 +438,9 @@ def train_or_load_model():
     if MODEL_PATH.exists():
         bundle = joblib.load(MODEL_PATH)
         metrics = pd.read_csv(METRICS_CSV).iloc[0].to_dict() if METRICS_CSV.exists() else None
-        return bundle["model"], metrics
+        return bundle["model"], bundle.get("feature_columns", ALL_FEATURES), set(bundle.get("seen_pairs", [])), metrics
 
-    with st.spinner("Training NFL classifier (RF + sigmoid calibration)…"):
-        # build training frame from game log
+    with st.spinner("Training NFL classifier (group-aware CV)…"):
         gl = glog.copy()
         gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
         gl["Away Team"] = gl["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
@@ -455,16 +454,18 @@ def train_or_load_model():
             h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
             x = build_feature_dict(h_off, a_off, h_def, a_def)
             home_win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
-            rows.append({**x, "home_win": home_win})
+            pair_key = "||".join(sorted([ht, at]))  # unordered matchup ID
+            rows.append({**x, "home_win": home_win, "pair_key": pair_key})
 
         feat = pd.DataFrame(rows)
         if len(feat) < 25:
             st.error("Not enough rows from the game log to train the NFL model. Check team names/scores.")
             st.stop()
 
-        X = feat.drop(columns=["home_win"]).copy()
+        X = feat.drop(columns=["home_win","pair_key"]).copy()
         X = X[ALL_FEATURES]
         y = feat["home_win"].values
+        groups = feat["pair_key"].values
         Xv = X.values
 
         rf_params = dict(
@@ -477,10 +478,9 @@ def train_or_load_model():
             n_jobs=-1,
         )
 
-        # Out-of-fold probabilities for honest metrics
-        oof = _oof_calibrated_proba(Xv, y, rf_params, n_splits=5, seed=42)
+        # Group-aware OOF probs for honest metrics (no same-pair leakage)
+        oof = _oof_calibrated_proba_grouped(Xv, y, groups, rf_params, n_splits=5, seed=42)
         y_hat = (oof >= 0.5).astype(int)
-
         metrics = {
             "auc": float(roc_auc_score(y, oof)),
             "log_loss": float(log_loss(y, oof, eps=1e-15)),
@@ -489,15 +489,19 @@ def train_or_load_model():
             "n": int(len(y)),
         }
 
-        # Fit on full data + calibrate
+        # Fit final model on full data + calibrate
         rf_full = RandomForestClassifier(**rf_params, random_state=42)
         rf_full.fit(Xv, y)
         cal_full = CalibratedClassifierCV(rf_full, method="sigmoid", cv="prefit")
         cal_full.fit(Xv, y)
 
-        joblib.dump({"model": cal_full, "feature_columns": ALL_FEATURES}, MODEL_PATH)
+        seen_pairs = set(feat["pair_key"].unique())
+        joblib.dump(
+            {"model": cal_full, "feature_columns": ALL_FEATURES, "seen_pairs": seen_pairs},
+            MODEL_PATH
+        )
         pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
-        return cal_full, metrics
+        return cal_full, ALL_FEATURES, seen_pairs, metrics
 
 def predict_proba_clipped(clf, vec, clip_low=0.10, clip_high=0.90):
     """Clip probabilities into [clip_low, clip_high] to avoid overconfident outputs."""
@@ -505,15 +509,14 @@ def predict_proba_clipped(clf, vec, clip_low=0.10, clip_high=0.90):
     return float(np.clip(p, clip_low, clip_high))
 
 # -------- Streamlit UI --------
-st.title("🏈 NFL Matchup Predictor (CSV-only, calibrated, clipped)")
-st.caption("RF (regularized) + sigmoid calibration. Probabilities are capped into a range to reduce overconfidence.")
+st.title("🏈 NFL Matchup Predictor (CSV-only, group-aware CV, clipped)")
+st.caption("RF (regularized) + sigmoid calibration. GroupKFold by matchup prevents leakage; outputs are clipped.")
 
-# Let you adjust clipping if you want
 with st.expander("⚙️ Probability clipping"):
     clip_low = st.slider("Minimum probability", 0.00, 0.30, 0.10, 0.01)
     clip_high = st.slider("Maximum probability", 0.70, 1.00, 0.90, 0.01)
 
-clf, cv_metrics = train_or_load_model()
+clf, feature_columns, seen_pairs, cv_metrics = train_or_load_model()
 
 c1, c2 = st.columns(2)
 with c1:
@@ -529,7 +532,7 @@ if home_team and away_team:
     else:
         h_off, a_off, h_def, a_def = off_d[home_team], off_d[away_team], def_d[home_team], def_d[away_team]
         x = build_feature_dict(h_off, a_off, h_def, a_def)
-        vec = pd.DataFrame([{k: x[k] for k in ALL_FEATURES}]).values
+        vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
 
         prob_home = predict_proba_clipped(clf, vec, clip_low=clip_low, clip_high=clip_high)
         prob_away = 1.0 - prob_home
@@ -541,11 +544,17 @@ if home_team and away_team:
         c3.metric(f"{home_team} Win Probability", f"{prob_home*100:.1f}%")
         c4.metric(f"{away_team} Win Probability", f"{prob_away*100:.1f}%")
 
+        pair_key_ui = "||".join(sorted([home_team, away_team]))
+        if pair_key_ui in seen_pairs:
+            st.info("ℹ️ This matchup pair exists in the training data. "
+                    "Group-aware CV prevents data leakage from similar games.")
+
         with st.expander("Inputs used by the model"):
-            st.json({k: f"{x[k]:+.3f}" for k in ALL_FEATURES})
+            st.json({k: f"{x[k]:+.3f}" for k in feature_columns})
 
         if cv_metrics:
-            with st.expander("Model CV metrics (OOF)"):
+            with st.expander("Model CV metrics (group-aware OOF)"):
                 st.write(cv_metrics)
+
 
 
