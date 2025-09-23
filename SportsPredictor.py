@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, header-normalized, group-aware CV, calibrated, capped confidence
+# 🏈 NFL Matchup Predictor — CSV-only, group-aware CV, calibrated, CLIPS FEATURE DIFFERENTIALS
 # =========================
 import os, glob, re
 import numpy as np
@@ -359,22 +359,17 @@ def _canonize_name(s: str) -> str:
 
 def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
     norm2orig = { _canonize_name(c): c for c in df.columns }
-
     def pick(*cands):
         for c in cands:
             if c in norm2orig: return norm2orig[c]
         return None
-
-    # Common aliases -> canonical
     team_col  = pick("team","teams")
     tot_perg  = pick("tot_yds_perg","total_yds_perg","yds_g","yds_perg","total_yards_per_game","total_yds_g","total_yds_game")
     pass_perg = pick("pass_yds_perg","passing_yds_perg","pass_yds_g","passing_yards_per_game","pass_yards_g","pass_yards_per_game")
     rush_perg = pick("rush_yds_perg","rushing_yds_perg","rush_yds_g","rushing_yards_per_game","rush_yards_g","rush_yards_per_game")
     pts_perg  = pick("pts_perg","points_per_game","pts_g","points_g")
-
     rename_map = {}
     if team_col:  rename_map[team_col]  = "Team"
-
     if is_defense:
         if tot_perg:  rename_map[tot_perg]  = "Tot_YDS_perG_Allowed"
         if pass_perg: rename_map[pass_perg] = "Pass_YDS_perG_Allowed"
@@ -385,14 +380,11 @@ def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
         if pass_perg: rename_map[pass_perg] = "Pass_YDS_perG"
         if rush_perg: rename_map[rush_perg] = "Rush_YDS_perG"
         if pts_perg:  rename_map[pts_perg]  = "PTS_perG"
-
     df = df.rename(columns=rename_map)
-
     with st.expander(("Defense" if is_defense else "Offense") + " column mapping"):
         st.write(rename_map)
     return df
 
-# Apply auto-rename, then trim whitespace
 off = _auto_rename(off, is_defense=False)
 defn = _auto_rename(defn, is_defense=True)
 off.columns  = [c.strip() for c in off.columns]
@@ -403,7 +395,6 @@ glog.columns = [c.strip() for c in glog.columns]
 off_req = {"Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"}
 def_req = {"Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"}
 log_req = {"Home Team","Away Team","Home Score","Away Score"}
-
 missing = []
 if not off_req.issubset(off.columns): missing.append(f"Offense CSV missing: {off_req - set(off.columns)}")
 if not def_req.issubset(defn.columns): missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
@@ -432,7 +423,7 @@ def z_off(row, col):  # offense per-G (higher = better)
 def inv_def(row, col_allowed):  # defense allowed (lower = better) -> invert so higher is better
     return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
-# -------- features --------
+# -------- features (raw edges) --------
 BASE_FEATURES = [
     "edge_pts","edge_pass","edge_rush","edge_tot",
     "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
@@ -440,7 +431,7 @@ BASE_FEATURES = [
 EXTRA_FEATURES = ["edge_pass_minus_rush","edge_pts_combo","edge_tot_combo"]
 ALL_FEATURES = BASE_FEATURES + EXTRA_FEATURES
 
-def build_feature_dict(h_off, a_off, h_def, a_def):
+def build_feature_dict_raw(h_off, a_off, h_def, a_def):
     x = {
         "edge_pts":  z_off(h_off, "PTS_perG")        - inv_def(a_def, "PTS_perG_Allowed"),
         "edge_pass": z_off(h_off, "Pass_YDS_perG")   - inv_def(a_def, "Pass_YDS_perG_Allowed"),
@@ -456,6 +447,28 @@ def build_feature_dict(h_off, a_off, h_def, a_def):
     x["edge_pts_combo"]       = x["edge_pts"]  + x["edge_pts_def"]
     x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
     return x
+
+# ---- NEW: per-feature clipping learned from data ----
+def learn_feature_caps(feat_df: pd.DataFrame, cols: list, quantile: float = 0.95) -> dict:
+    """Return dict of per-feature caps = qth percentile of absolute value."""
+    caps = {}
+    for c in cols:
+        caps[c] = float(np.nanpercentile(np.abs(feat_df[c].values), quantile * 100))
+        # safety floor in case distribution is tiny
+        if caps[c] < 0.5:
+            caps[c] = 0.5
+    return caps
+
+def apply_caps_to_series(x_dict: dict, caps: dict) -> dict:
+    """Clip each feature to [-cap, +cap] using learned per-feature caps."""
+    out = {}
+    for k, v in x_dict.items():
+        cap = caps.get(k, None)
+        if cap is None or not np.isfinite(cap):
+            out[k] = v
+        else:
+            out[k] = float(np.clip(v, -cap, cap))
+    return out
 
 # nickname → full team name (for aligning game log names)
 NAME_MAP = {
@@ -477,28 +490,30 @@ def _oof_calibrated_proba_grouped(X, y, groups, rf_params, n_splits=5, seed=42):
     for tr_idx, va_idx in gkf.split(X, y, groups):
         X_tr, X_va = X[tr_idx], X[va_idx]
         y_tr = y[tr_idx]
-
         rf = RandomForestClassifier(**rf_params, random_state=seed)
         rf.fit(X_tr, y_tr)
-
         cal = CalibratedClassifierCV(rf, method="sigmoid", cv="prefit")
         cal.fit(X_tr, y_tr)
-
         oof[va_idx] = cal.predict_proba(X_va)[:, 1]
     return oof
 
 @st.cache_resource(show_spinner=False)
-def train_or_load_model():
+def train_or_load_model(quantile_clip=0.95):
     if MODEL_PATH.exists():
         bundle = joblib.load(MODEL_PATH)
         metrics = pd.read_csv(METRICS_CSV).iloc[0].to_dict() if METRICS_CSV.exists() else None
-        return bundle["model"], bundle.get("feature_columns", ALL_FEATURES), set(bundle.get("seen_pairs", [])), metrics
+        model = bundle["model"]
+        feature_columns = bundle.get("feature_columns", ALL_FEATURES)
+        caps = bundle.get("feature_caps", {c: 2.0 for c in feature_columns})
+        seen_pairs = set(bundle.get("seen_pairs", []))
+        return model, feature_columns, caps, seen_pairs, metrics
 
-    with st.spinner("Training NFL classifier (group-aware CV)…"):
+    with st.spinner("Training NFL classifier (group-aware CV, feature-clipped)…"):
         gl = glog.copy()
         gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
         gl["Away Team"] = gl["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
 
+        # Build raw (unclipped) features
         rows = []
         for _, g in gl.iterrows():
             ht = str(g["Home Team"]).strip()
@@ -506,15 +521,24 @@ def train_or_load_model():
             if ht not in off_d or ht not in def_d or at not in off_d or at not in def_d:
                 continue
             h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
-            x = build_feature_dict(h_off, a_off, h_def, a_def)
+            x_raw = build_feature_dict_raw(h_off, a_off, h_def, a_def)
             home_win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
-            pair_key = "||".join(sorted([ht, at]))  # unordered matchup ID
-            rows.append({**x, "home_win": home_win, "pair_key": pair_key})
+            pair_key = "||".join(sorted([ht, at]))
+            rows.append({**x_raw, "home_win": home_win, "pair_key": pair_key})
 
-        feat = pd.DataFrame(rows)
-        if len(feat) < 25:
+        feat_raw = pd.DataFrame(rows)
+        if len(feat_raw) < 25:
             st.error("Not enough rows from the game log to train the NFL model. Check team names/scores.")
             st.stop()
+
+        # Learn per-feature caps from training distribution (95th pct of |value| by default)
+        caps = learn_feature_caps(feat_raw, ALL_FEATURES, quantile=quantile_clip)
+
+        # Apply clipping to training features
+        feat = feat_raw.copy()
+        for c in ALL_FEATURES:
+            cap = caps[c]
+            feat[c] = np.clip(feat[c].values, -cap, cap)
 
         X = feat.drop(columns=["home_win","pair_key"]).copy()
         X = X[ALL_FEATURES]
@@ -543,50 +567,34 @@ def train_or_load_model():
             "n": int(len(y)),
         }
 
-        # Fit final model on full data + calibrate
+        # Fit final model on FULL, CLIPPED data + calibrate
         rf_full = RandomForestClassifier(**rf_params, random_state=42)
         rf_full.fit(Xv, y)
         cal_full = CalibratedClassifierCV(rf_full, method="sigmoid", cv="prefit")
         cal_full.fit(Xv, y)
 
         seen_pairs = set(feat["pair_key"].unique())
-        joblib.dump({"model": cal_full, "feature_columns": ALL_FEATURES, "seen_pairs": seen_pairs}, MODEL_PATH)
+        joblib.dump({
+            "model": cal_full,
+            "feature_columns": ALL_FEATURES,
+            "feature_caps": caps,          # <- save caps for inference
+            "seen_pairs": seen_pairs
+        }, MODEL_PATH)
         pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
-        return cal_full, ALL_FEATURES, seen_pairs, metrics
-
-def predict_proba_with_limit(clf, vec, limit=0.30):
-    """
-    Enforce symmetric max deviation from 0.5.
-    Example: limit=0.30 → p in [0.20, 0.80].
-    """
-    p = float(clf.predict_proba(vec)[0, 1])
-    lo, hi = 0.5 - limit, 0.5 + limit
-    if p < lo: return lo
-    if p > hi: return hi
-    return p
+        return cal_full, ALL_FEATURES, caps, seen_pairs, metrics
 
 # -------- UI --------
-st.title("🏈 NFL Matchup Predictor (CSV-only, group-aware CV, capped confidence)")
-st.caption("RF (regularized) + sigmoid calibration. GroupKFold by matchup prevents leakage; outputs capped around 50/50.")
+st.title("🏈 NFL Matchup Predictor (CSV-only, group-aware CV, clipped STAT EDGES)")
+st.caption("RF (regularized) + sigmoid calibration. We clip feature differentials (learned caps) to avoid crazy edges.")
 
-with st.expander("⚙️ Probability cap (max confidence)"):
-    limit = st.slider(
-        "Max deviation from 50/50",
-        0.05, 0.45, 0.30, 0.01,
-        help="Sets the furthest a probability may move away from 0.5. 0.30 → 20–80; 0.25 → 25–75."
-    )
-    stricter_seen = st.checkbox(
-        "Use stricter cap for seen matchups",
-        value=True,
-        help="If a pair existed in training, clamp closer to 50/50."
-    )
-    limit_seen = st.slider(
-        "Max deviation for seen matchups",
-        0.05, 0.45, 0.25, 0.01,
-        help="Only used when 'stricter cap' is enabled."
+with st.expander("⚙️ Feature clipping (training-time)"):
+    q = st.slider(
+        "Clip edges at this quantile of |value| (retrain to take effect)",
+        0.80, 0.99, 0.95, 0.01,
+        help="We learn a per-feature cap at this quantile over training edges, and clip train+serve to that cap."
     )
 
-clf, feature_columns, seen_pairs, cv_metrics = train_or_load_model()
+clf, feature_columns, feature_caps, seen_pairs, cv_metrics = train_or_load_model(quantile_clip=q)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -602,7 +610,7 @@ if home_team and away_team:
     else:
         h_off, a_off, h_def, a_def = off_d[home_team], off_d[away_team], def_d[home_team], def_d[away_team]
         try:
-            x = build_feature_dict(h_off, a_off, h_def, a_def)
+            x_raw = build_feature_dict_raw(h_off, a_off, h_def, a_def)
         except KeyError as e:
             st.error(f"Missing expected column `{e.args[0]}` after auto-rename.")
             with st.expander("Available offense/defense columns now"):
@@ -610,13 +618,11 @@ if home_team and away_team:
                 st.write("Defense:", list(defn.columns))
             st.stop()
 
+        # Apply the SAME per-feature caps learned during training
+        x = apply_caps_to_series(x_raw, feature_caps)
+
         vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
-
-        # Apply limit (stricter for seen pairs, if selected)
-        pair_key_ui = "||".join(sorted([home_team, away_team]))
-        this_limit = limit_seen if (stricter_seen and pair_key_ui in seen_pairs) else limit
-
-        prob_home = predict_proba_with_limit(clf, vec, limit=this_limit)
+        prob_home = float(clf.predict_proba(vec)[0, 1])
         prob_away = 1.0 - prob_home
         winner = home_team if prob_home >= prob_away else away_team
 
@@ -626,17 +632,17 @@ if home_team and away_team:
         c3.metric(f"{home_team} Win Probability", f"{prob_home*100:.1f}%")
         c4.metric(f"{away_team} Win Probability", f"{prob_away*100:.1f}%")
 
+        pair_key_ui = "||".join(sorted([home_team, away_team]))
         if pair_key_ui in seen_pairs:
             st.info("ℹ️ This matchup pair exists in the training data. Group-aware CV prevents overconfident repeats.")
 
-        with st.expander("Inputs used by the model"):
+        with st.expander("Inputs used by the model (after CLIP)"):
             st.json({k: f"{x[k]:+.3f}" for k in feature_columns})
+        with st.expander("Raw edges before clip"):
+            st.json({k: f"{x_raw[k]:+.3f}" for k in feature_columns})
+        with st.expander("Per-feature caps (|edge| ≤ cap)"):
+            st.json({k: f"{feature_caps[k]:.3f}" for k in feature_columns})
 
         if cv_metrics:
             with st.expander("Model CV metrics (group-aware OOF)"):
                 st.write(cv_metrics)
-
-
-
-
-
