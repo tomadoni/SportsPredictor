@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, fast, calibrated, with probability tempering
+# 🏈 NFL Matchup Predictor — CSV-only, fast, calibrated, with probability clipping
 # =========================
 import os, glob
 import numpy as np
@@ -434,8 +434,7 @@ def _oof_calibrated_proba(X, y, rf_params, n_splits=5, seed=42):
     return oof
 
 @st.cache_resource(show_spinner=False)
-def train_or_load_model(feat_df: pd.DataFrame):
-    # load if available
+def train_or_load_model():
     if MODEL_PATH.exists():
         bundle = joblib.load(MODEL_PATH)
         metrics = pd.read_csv(METRICS_CSV).iloc[0].to_dict() if METRICS_CSV.exists() else None
@@ -464,7 +463,7 @@ def train_or_load_model(feat_df: pd.DataFrame):
             st.stop()
 
         X = feat.drop(columns=["home_win"]).copy()
-        X = X[ALL_FEATURES]  # enforce order
+        X = X[ALL_FEATURES]
         y = feat["home_win"].values
         Xv = X.values
 
@@ -475,10 +474,10 @@ def train_or_load_model(feat_df: pd.DataFrame):
             min_samples_split=10,
             max_features="sqrt",
             class_weight="balanced_subsample",
-            n_jobs=-1,  # speed
+            n_jobs=-1,
         )
 
-        # OOF probs for honest metrics
+        # Out-of-fold probabilities for honest metrics
         oof = _oof_calibrated_proba(Xv, y, rf_params, n_splits=5, seed=42)
         y_hat = (oof >= 0.5).astype(int)
 
@@ -500,30 +499,21 @@ def train_or_load_model(feat_df: pd.DataFrame):
         pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
         return cal_full, metrics
 
-def predict_proba_tempered(clf, vec, clip_low=0.05, clip_high=0.95, shrink=0.85):
-    """
-    Temper probabilities to avoid overconfident extremes:
-      1) clip to [clip_low, clip_high]
-      2) shrink toward 0.5: p' = 0.5 + (p - 0.5) * shrink
-    """
+def predict_proba_clipped(clf, vec, clip_low=0.10, clip_high=0.90):
+    """Clip probabilities into [clip_low, clip_high] to avoid overconfident outputs."""
     p = float(clf.predict_proba(vec)[0, 1])
-    p = float(np.clip(p, clip_low, clip_high))
-    p = 0.5 + (p - 0.5) * float(shrink)
-    return p
+    return float(np.clip(p, clip_low, clip_high))
 
 # -------- Streamlit UI --------
-st.title("🏈 NFL Matchup Predictor (CSV-only, calibrated, tempered)")
-st.caption("RF (regularized) + sigmoid calibration. Probabilities clipped & optionally shrunk toward 50/50.")
+st.title("🏈 NFL Matchup Predictor (CSV-only, calibrated, clipped)")
+st.caption("RF (regularized) + sigmoid calibration. Probabilities are capped into a range to reduce overconfidence.")
 
-# Tempering controls
-with st.expander("⚙️ Probability tempering"):
-    clip_low = st.slider("Minimum probability", 0.00, 0.20, 0.05, 0.01, help="Lower bound for any team's win prob.")
-    clip_high = st.slider("Maximum probability", 0.80, 1.00, 0.95, 0.01, help="Upper bound for any team's win prob.")
-    shrink = st.slider("Shrink toward 50/50", 0.00, 1.00, 0.85, 0.05,
-                       help="1.0 = no shrink; 0.0 = force 50/50. Pulls extreme matchups closer to even.")
+# Let you adjust clipping if you want
+with st.expander("⚙️ Probability clipping"):
+    clip_low = st.slider("Minimum probability", 0.00, 0.30, 0.10, 0.01)
+    clip_high = st.slider("Maximum probability", 0.70, 1.00, 0.90, 0.01)
 
-# Train/load once
-clf, cv_metrics = train_or_load_model(glog)
+clf, cv_metrics = train_or_load_model()
 
 c1, c2 = st.columns(2)
 with c1:
@@ -541,7 +531,7 @@ if home_team and away_team:
         x = build_feature_dict(h_off, a_off, h_def, a_def)
         vec = pd.DataFrame([{k: x[k] for k in ALL_FEATURES}]).values
 
-        prob_home = predict_proba_tempered(clf, vec, clip_low=clip_low, clip_high=clip_high, shrink=shrink)
+        prob_home = predict_proba_clipped(clf, vec, clip_low=clip_low, clip_high=clip_high)
         prob_away = 1.0 - prob_home
         winner = home_team if prob_home >= prob_away else away_team
 
@@ -557,7 +547,5 @@ if home_team and away_team:
         if cv_metrics:
             with st.expander("Model CV metrics (OOF)"):
                 st.write(cv_metrics)
-
-
 
 
