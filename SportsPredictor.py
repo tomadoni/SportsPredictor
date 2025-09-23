@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, group-aware CV, calibrated, CLIPS FEATURE DIFFERENTIALS
+# 🏈 NFL Matchup Predictor — CSV-only, group-aware CV, FEATURE-CLIPPED, with Conservative LR option
 # =========================
 import os, glob, re
 import numpy as np
@@ -314,6 +314,7 @@ import joblib
 from pathlib import Path
 from sklearn.model_selection import GroupKFold
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, brier_score_loss
 
@@ -448,72 +449,91 @@ def build_feature_dict_raw(h_off, a_off, h_def, a_def):
     x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
     return x
 
-# ---- NEW: per-feature clipping learned from data ----
-def learn_feature_caps(feat_df: pd.DataFrame, cols: list, quantile: float = 0.95) -> dict:
-    """Return dict of per-feature caps = qth percentile of absolute value."""
+# ---- per-feature clipping learned from data ----
+def learn_feature_caps(feat_df: pd.DataFrame, cols: list, quantile: float = 0.90) -> dict:
     caps = {}
     for c in cols:
         caps[c] = float(np.nanpercentile(np.abs(feat_df[c].values), quantile * 100))
-        # safety floor in case distribution is tiny
-        if caps[c] < 0.5:
+        if not np.isfinite(caps[c]) or caps[c] < 0.5:
             caps[c] = 0.5
     return caps
 
 def apply_caps_to_series(x_dict: dict, caps: dict) -> dict:
-    """Clip each feature to [-cap, +cap] using learned per-feature caps."""
     out = {}
     for k, v in x_dict.items():
         cap = caps.get(k, None)
-        if cap is None or not np.isfinite(cap):
-            out[k] = v
-        else:
-            out[k] = float(np.clip(v, -cap, cap))
+        out[k] = float(np.clip(v, -cap, cap)) if cap is not None else float(v)
     return out
 
-# nickname → full team name (for aligning game log names)
-NAME_MAP = {
-    "49ers":"San Francisco 49ers","Niners":"San Francisco 49ers","Bears":"Chicago Bears","Lions":"Detroit Lions",
-    "Packers":"Green Bay Packers","Vikings":"Minnesota Vikings","Cowboys":"Dallas Cowboys","Giants":"New York Giants",
-    "Eagles":"Philadelphia Eagles","Commanders":"Washington Commanders","Rams":"Los Angeles Rams","Seahawks":"Seattle Seahawks",
-    "Cardinals":"Arizona Cardinals","Saints":"New Orleans Saints","Buccaneers":"Tampa Bay Buccaneers","Bucs":"Tampa Bay Buccaneers",
-    "Falcons":"Atlanta Falcons","Panthers":"Carolina Panthers",
-    "Bills":"Buffalo Bills","Dolphins":"Miami Dolphins","Patriots":"New England Patriots","Jets":"New York Jets",
-    "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cleveland Browns","Steelers":"Pittsburgh Steelers",
-    "Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars","Titans":"Tennessee Titans",
-    "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
-}
-
-# -------- group-aware OOF with calibrated RF (no leakage by matchup) --------
-def _oof_calibrated_proba_grouped(X, y, groups, rf_params, n_splits=5, seed=42):
-    gkf = GroupKFold(n_splits=n_splits)
+# -------- group-aware OOF with chosen model --------
+def _oof_grouped(X, y, groups, model_kind="lr", seed=42):
+    gkf = GroupKFold(n_splits=5)
     oof = np.zeros(len(y), dtype=float)
+
     for tr_idx, va_idx in gkf.split(X, y, groups):
         X_tr, X_va = X[tr_idx], X[va_idx]
         y_tr = y[tr_idx]
-        rf = RandomForestClassifier(**rf_params, random_state=seed)
-        rf.fit(X_tr, y_tr)
-        cal = CalibratedClassifierCV(rf, method="sigmoid", cv="prefit")
-        cal.fit(X_tr, y_tr)
-        oof[va_idx] = cal.predict_proba(X_va)[:, 1]
+
+        if model_kind == "rf":
+            rf = RandomForestClassifier(
+                n_estimators=200,      # more conservative
+                max_depth=8,
+                min_samples_leaf=10,
+                min_samples_split=20,
+                max_features="sqrt",
+                class_weight="balanced_subsample",
+                n_jobs=-1,
+                random_state=seed
+            )
+            rf.fit(X_tr, y_tr)
+            # still do sigmoid calibration (gentler than isotonic)
+            model = CalibratedClassifierCV(rf, method="sigmoid", cv="prefit")
+            model.fit(X_tr, y_tr)
+        else:
+            # Conservative Logistic Regression (stronger regularization)
+            model = LogisticRegression(
+                penalty="l2", C=0.5, solver="lbfgs", max_iter=1000,
+                class_weight="balanced", random_state=seed
+            )
+            model.fit(X_tr, y_tr)
+
+        oof[va_idx] = model.predict_proba(X_va)[:, 1]
+
     return oof
 
 @st.cache_resource(show_spinner=False)
-def train_or_load_model(quantile_clip=0.95):
-    if MODEL_PATH.exists():
-        bundle = joblib.load(MODEL_PATH)
-        metrics = pd.read_csv(METRICS_CSV).iloc[0].to_dict() if METRICS_CSV.exists() else None
+def train_or_load_model(model_kind="lr", quantile_clip=0.90):
+    tag = f"{model_kind}_q{int(quantile_clip*100)}"
+    model_path = Path(f"nfl_best_classifier_{tag}.joblib")
+    metrics_csv = Path(f"nfl_best_classifier_metrics_{tag}.csv")
+
+    if model_path.exists():
+        bundle = joblib.load(model_path)
+        metrics = pd.read_csv(metrics_csv).iloc[0].to_dict() if metrics_csv.exists() else None
         model = bundle["model"]
         feature_columns = bundle.get("feature_columns", ALL_FEATURES)
         caps = bundle.get("feature_caps", {c: 2.0 for c in feature_columns})
         seen_pairs = set(bundle.get("seen_pairs", []))
         return model, feature_columns, caps, seen_pairs, metrics
 
-    with st.spinner("Training NFL classifier (group-aware CV, feature-clipped)…"):
+    with st.spinner(f"Training NFL classifier ({'Conservative LR' if model_kind=='lr' else 'RF'}, grouped CV, clipped features)…"):
         gl = glog.copy()
+        # normalize team names
+        NAME_MAP = {
+            "49ers":"San Francisco 49ers","Niners":"San Francisco 49ers","Bears":"Chicago Bears","Lions":"Detroit Lions",
+            "Packers":"Green Bay Packers","Vikings":"Minnesota Vikings","Cowboys":"Dallas Cowboys","Giants":"New York Giants",
+            "Eagles":"Philadelphia Eagles","Commanders":"Washington Commanders","Rams":"Los Angeles Rams","Seahawks":"Seattle Seahawks",
+            "Cardinals":"Arizona Cardinals","Saints":"New Orleans Saints","Buccaneers":"Tampa Bay Buccaneers","Bucs":"Tampa Bay Buccaneers",
+            "Falcons":"Atlanta Falcons","Panthers":"Carolina Panthers","Bills":"Buffalo Bills","Dolphins":"Miami Dolphins",
+            "Patriots":"New England Patriots","Jets":"New York Jets","Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals",
+            "Browns":"Cleveland Browns","Steelers":"Pittsburgh Steelers","Texans":"Houston Texans","Colts":"Indianapolis Colts",
+            "Jaguars":"Jacksonville Jaguars","Titans":"Tennessee Titans","Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs",
+            "Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
+        }
         gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
         gl["Away Team"] = gl["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
 
-        # Build raw (unclipped) features
+        # Build raw features
         rows = []
         for _, g in gl.iterrows():
             ht = str(g["Home Team"]).strip()
@@ -531,10 +551,10 @@ def train_or_load_model(quantile_clip=0.95):
             st.error("Not enough rows from the game log to train the NFL model. Check team names/scores.")
             st.stop()
 
-        # Learn per-feature caps from training distribution (95th pct of |value| by default)
+        # Learn tighter per-feature caps (default q=0.90)
         caps = learn_feature_caps(feat_raw, ALL_FEATURES, quantile=quantile_clip)
 
-        # Apply clipping to training features
+        # Apply caps
         feat = feat_raw.copy()
         for c in ALL_FEATURES:
             cap = caps[c]
@@ -546,18 +566,8 @@ def train_or_load_model(quantile_clip=0.95):
         groups = feat["pair_key"].values
         Xv = X.values
 
-        rf_params = dict(
-            n_estimators=300,
-            max_depth=12,
-            min_samples_leaf=5,
-            min_samples_split=10,
-            max_features="sqrt",
-            class_weight="balanced_subsample",
-            n_jobs=-1,
-        )
-
-        # Group-aware OOF probs for honest metrics
-        oof = _oof_calibrated_proba_grouped(Xv, y, groups, rf_params, n_splits=5, seed=42)
+        # Group-aware OOF
+        oof = _oof_grouped(Xv, y, groups, model_kind=model_kind, seed=42)
         y_hat = (oof >= 0.5).astype(int)
         metrics = {
             "auc": float(roc_auc_score(y, oof)),
@@ -567,34 +577,50 @@ def train_or_load_model(quantile_clip=0.95):
             "n": int(len(y)),
         }
 
-        # Fit final model on FULL, CLIPPED data + calibrate
-        rf_full = RandomForestClassifier(**rf_params, random_state=42)
-        rf_full.fit(Xv, y)
-        cal_full = CalibratedClassifierCV(rf_full, method="sigmoid", cv="prefit")
-        cal_full.fit(Xv, y)
+        # Fit final model on full, clipped data
+        if model_kind == "rf":
+            base = RandomForestClassifier(
+                n_estimators=200, max_depth=8, min_samples_leaf=10, min_samples_split=20,
+                max_features="sqrt", class_weight="balanced_subsample", n_jobs=-1, random_state=42
+            )
+            base.fit(Xv, y)
+            model = CalibratedClassifierCV(base, method="sigmoid", cv="prefit")
+            model.fit(Xv, y)
+        else:
+            model = LogisticRegression(
+                penalty="l2", C=0.5, solver="lbfgs", max_iter=1000,
+                class_weight="balanced", random_state=42
+            )
+            model.fit(Xv, y)
 
         seen_pairs = set(feat["pair_key"].unique())
         joblib.dump({
-            "model": cal_full,
+            "model": model,
             "feature_columns": ALL_FEATURES,
-            "feature_caps": caps,          # <- save caps for inference
-            "seen_pairs": seen_pairs
-        }, MODEL_PATH)
-        pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
-        return cal_full, ALL_FEATURES, caps, seen_pairs, metrics
+            "feature_caps": caps,
+            "seen_pairs": seen_pairs,
+            "model_kind": model_kind,
+            "quantile_clip": quantile_clip
+        }, model_path)
+        pd.DataFrame([metrics]).to_csv(metrics_csv, index=False)
+        return model, ALL_FEATURES, caps, seen_pairs, metrics
 
 # -------- UI --------
-st.title("🏈 NFL Matchup Predictor (CSV-only, group-aware CV, clipped STAT EDGES)")
-st.caption("RF (regularized) + sigmoid calibration. We clip feature differentials (learned caps) to avoid crazy edges.")
+st.title("🏈 NFL Matchup Predictor (feature-clipped, group-aware CV)")
+st.caption("Conservative probability gaps via tighter edge caps + Logistic Regression option (or a gentler RF).")
 
-with st.expander("⚙️ Feature clipping (training-time)"):
+colA, colB = st.columns(2)
+with colA:
+    model_kind = st.selectbox("Model type", ["Conservative (Logistic Regression)", "Random Forest (gentler)"], index=0)
+    model_key = "lr" if model_kind.startswith("Conservative") else "rf"
+with colB:
     q = st.slider(
         "Clip edges at this quantile of |value| (retrain to take effect)",
-        0.80, 0.99, 0.95, 0.01,
-        help="We learn a per-feature cap at this quantile over training edges, and clip train+serve to that cap."
+        0.80, 0.99, 0.90, 0.01,
+        help="Learn per-feature caps from training distribution; lower = tighter caps (smaller gaps)."
     )
 
-clf, feature_columns, feature_caps, seen_pairs, cv_metrics = train_or_load_model(quantile_clip=q)
+clf, feature_columns, feature_caps, seen_pairs, cv_metrics = train_or_load_model(model_kind=model_key, quantile_clip=q)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -609,16 +635,8 @@ if home_team and away_team:
         st.error("Could not find team stats for one or both teams.")
     else:
         h_off, a_off, h_def, a_def = off_d[home_team], off_d[away_team], def_d[home_team], def_d[away_team]
-        try:
-            x_raw = build_feature_dict_raw(h_off, a_off, h_def, a_def)
-        except KeyError as e:
-            st.error(f"Missing expected column `{e.args[0]}` after auto-rename.")
-            with st.expander("Available offense/defense columns now"):
-                st.write("Offense:", list(off.columns))
-                st.write("Defense:", list(defn.columns))
-            st.stop()
-
-        # Apply the SAME per-feature caps learned during training
+        x_raw = build_feature_dict_raw(h_off, a_off, h_def, a_def)
+        # Apply SAME caps as training
         x = apply_caps_to_series(x_raw, feature_caps)
 
         vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
@@ -646,3 +664,4 @@ if home_team and away_team:
         if cv_metrics:
             with st.expander("Model CV metrics (group-aware OOF)"):
                 st.write(cv_metrics)
+
