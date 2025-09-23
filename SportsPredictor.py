@@ -347,6 +347,11 @@ off = pd.read_csv(OFF_PATH)
 defn = pd.read_csv(DEF_PATH)
 glog = pd.read_csv(LOG_PATH)
 
+# normalize headers (trim whitespace)
+off.columns = [c.strip() for c in off.columns]
+defn.columns = [c.strip() for c in defn.columns]
+glog.columns = [c.strip() for c in glog.columns]
+
 off_req = {"Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"}
 def_req = {"Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"}
 log_req = {"Home Team","Away Team","Home Score","Away Score"}
@@ -388,22 +393,24 @@ EXTRA_FEATURES = ["edge_pass_minus_rush","edge_pts_combo","edge_tot_combo"]
 ALL_FEATURES = BASE_FEATURES + EXTRA_FEATURES
 
 def build_feature_dict(h_off, a_off, h_def, a_def):
+    # explicit, correct column names
     x = {
-        "edge_pts":  z_off(h_off, "PTS_perG") - inv_def(a_def, "PTS_PERG_ALLOWED".lower().replace("perg","perG_Allowed").replace("pts_","PTS_")),
-        "edge_pass": z_off(h_off, "Pass_YDS_perG") - inv_def(a_def, "Pass_YDS_perG_Allowed"),
-        "edge_rush": z_off(h_off, "Rush_YDS_perG") - inv_def(a_def, "Rush_YDS_perG_Allowed"),
-        "edge_tot":  z_off(h_off, "Tot_YDS_perG")  - inv_def(a_def, "Tot_YDS_perG_Allowed"),
-        "edge_pts_def":  inv_def(h_def, "PTS_perG_Allowed") - z_off(a_off, "PTS_perG"),
-        "edge_pass_def": inv_def(h_def, "Pass_YDS_perG_Allowed") - z_off(a_off, "Pass_YDS_perG"),
-        "edge_rush_def": inv_def(h_def, "Rush_YDS_perG_Allowed") - z_off(a_off, "Rush_YDS_perG"),
-        "edge_tot_def":  inv_def(h_def, "Tot_YDS_perG_Allowed")  - z_off(a_off, "Tot_YDS_perG"),
+        "edge_pts":  z_off(h_off, "PTS_perG")        - inv_def(a_def, "PTS_perG_Allowed"),
+        "edge_pass": z_off(h_off, "Pass_YDS_perG")   - inv_def(a_def, "Pass_YDS_perG_Allowed"),
+        "edge_rush": z_off(h_off, "Rush_YDS_perG")   - inv_def(a_def, "Rush_YDS_perG_Allowed"),
+        "edge_tot":  z_off(h_off, "Tot_YDS_perG")    - inv_def(a_def, "Tot_YDS_perG_Allowed"),
+
+        "edge_pts_def":  inv_def(h_def, "PTS_perG_Allowed")        - z_off(a_off, "PTS_perG"),
+        "edge_pass_def": inv_def(h_def, "Pass_YDS_perG_Allowed")   - z_off(a_off, "Pass_YDS_perG"),
+        "edge_rush_def": inv_def(h_def, "Rush_YDS_perG_Allowed")   - z_off(a_off, "Rush_YDS_perG"),
+        "edge_tot_def":  inv_def(h_def, "Tot_YDS_perG_Allowed")    - z_off(a_off, "Tot_YDS_perG"),
     }
     x["edge_pass_minus_rush"] = x["edge_pass"] - x["edge_rush"]
     x["edge_pts_combo"]       = x["edge_pts"]  + x["edge_pts_def"]
     x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
     return x
 
-# nickname → full team name (for training)
+# nickname → full team name (for training alignment)
 NAME_MAP = {
     "49ers":"San Francisco 49ers","Niners":"San Francisco 49ers","Bears":"Chicago Bears","Lions":"Detroit Lions",
     "Packers":"Green Bay Packers","Vikings":"Minnesota Vikings","Cowboys":"Dallas Cowboys","Giants":"New York Giants",
@@ -531,7 +538,15 @@ if home_team and away_team:
         st.error("Could not find team stats for one or both teams.")
     else:
         h_off, a_off, h_def, a_def = off_d[home_team], off_d[away_team], def_d[home_team], def_d[away_team]
-        x = build_feature_dict(h_off, a_off, h_def, a_def)
+        try:
+            x = build_feature_dict(h_off, a_off, h_def, a_def)
+        except KeyError as e:
+            st.error(f"Missing column `{e.args[0]}` in Off/Def tables.")
+            with st.expander("Available columns"):
+                st.write("Offense:", list(off.columns))
+                st.write("Defense:", list(defn.columns))
+            st.stop()
+
         vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
 
         prob_home = predict_proba_clipped(clf, vec, clip_low=clip_low, clip_high=clip_high)
@@ -546,8 +561,7 @@ if home_team and away_team:
 
         pair_key_ui = "||".join(sorted([home_team, away_team]))
         if pair_key_ui in seen_pairs:
-            st.info("ℹ️ This matchup pair exists in the training data. "
-                    "Group-aware CV prevents data leakage from similar games.")
+            st.info("ℹ️ This matchup pair exists in the training data. Group-aware CV prevents overconfident repeats.")
 
         with st.expander("Inputs used by the model"):
             st.json({k: f"{x[k]:+.3f}" for k in feature_columns})
@@ -555,6 +569,7 @@ if home_team and away_team:
         if cv_metrics:
             with st.expander("Model CV metrics (group-aware OOF)"):
                 st.write(cv_metrics)
+
 
 
 
