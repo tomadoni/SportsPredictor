@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — Simple Version
+# 🏈 NFL Matchup Predictor — Simple, conservative, clipped stat edges
 # =========================
 import os, glob, re
 import numpy as np
@@ -316,11 +316,12 @@ from sklearn.model_selection import GroupKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, brier_score_loss
 
-# -------- file finder --------
+# ---------- file finder ----------
 def _find_one(possibles):
     for p in possibles:
         hits = glob.glob(p)
-        if hits: return hits[0]
+        if hits:
+            return hits[0]
     return None
 
 OFF_PATH = _find_one(["NFL_Offense.csv", "data/NFL_Offense.csv"])
@@ -333,11 +334,12 @@ if not OFF_PATH or not DEF_PATH or not LOG_PATH:
     st.error("Missing NFL CSV files (`NFL_Offense.csv`, `NFL_Defense.csv`, `NFL_Game_log.csv`).")
     st.stop()
 
+# ---------- load ----------
 off = pd.read_csv(OFF_PATH)
 defn = pd.read_csv(DEF_PATH)
 glog = pd.read_csv(LOG_PATH)
 
-# -------- normalize headers --------
+# ---------- canonicalize headers ----------
 def _canonize_name(s: str) -> str:
     s = re.sub(r"\s+", " ", str(s).strip()).lower()
     s = s.replace("%", "pct")
@@ -347,15 +349,19 @@ def _canonize_name(s: str) -> str:
 
 def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
     norm2orig = {_canonize_name(c): c for c in df.columns}
+
     def pick(*cands):
         for c in cands:
-            if c in norm2orig: return norm2orig[c]
+            if c in norm2orig:
+                return norm2orig[c]
         return None
+
     team_col  = pick("team","teams")
-    tot_perg  = pick("tot_yds_perg","total_yds_perg","yds_g","yds_perg")
+    tot_perg  = pick("tot_yds_perg","total_yds_perg","yds_g","yds_perg","total_yards_per_game")
     pass_perg = pick("pass_yds_perg","passing_yds_perg","pass_yds_g","passing_yards_per_game")
     rush_perg = pick("rush_yds_perg","rushing_yds_perg","rush_yds_g","rushing_yards_per_game")
     pts_perg  = pick("pts_perg","points_per_game","pts_g")
+
     rename_map = {}
     if team_col: rename_map[team_col] = "Team"
     if is_defense:
@@ -368,23 +374,79 @@ def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
         if pass_perg: rename_map[pass_perg] = "Pass_YDS_perG"
         if rush_perg: rename_map[rush_perg] = "Rush_YDS_perG"
         if pts_perg:  rename_map[pts_perg]  = "PTS_perG"
+
     return df.rename(columns=rename_map)
 
-off = _auto_rename(off, False)
-defn = _auto_rename(defn, True)
+off = _auto_rename(off, is_defense=False)
+defn = _auto_rename(defn, is_defense=True)
 
-# -------- stats contexts --------
+# ---------- validate ----------
+off_req = {"Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"}
+def_req = {"Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"}
+log_req = {"Home Team","Away Team","Home Score","Away Score"}
+
+missing = []
+if not off_req.issubset(off.columns): missing.append(f"Offense CSV missing: {off_req - set(off.columns)}")
+if not def_req.issubset(defn.columns): missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
+if not log_req.issubset(glog.columns): missing.append(f"Game log CSV missing: {log_req - set(glog.columns)}")
+if missing:
+    st.error("Column mismatch:\n- " + "\n- ".join(missing))
+    st.stop()
+
+# ---------- name mapping (game log → full names in off/def files) ----------
+NAME_MAP = {
+    "49ers": "San Francisco 49ers",
+    "Bears": "Chicago Bears",
+    "Bengals": "Cincinnati Bengals",
+    "Bills": "Buffalo Bills",
+    "Broncos": "Denver Broncos",
+    "Browns": "Cleveland Browns",
+    "Buccaneers": "Tampa Bay Buccaneers",
+    "Cardinals": "Arizona Cardinals",
+    "Chargers": "Los Angeles Chargers",
+    "Chiefs": "Kansas City Chiefs",
+    "Colts": "Indianapolis Colts",
+    "Commanders": "Washington Commanders",
+    "Cowboys": "Dallas Cowboys",
+    "Dolphins": "Miami Dolphins",
+    "Eagles": "Philadelphia Eagles",
+    "Falcons": "Atlanta Falcons",
+    "Giants": "New York Giants",
+    "Jaguars": "Jacksonville Jaguars",
+    "Jets": "New York Jets",
+    "Lions": "Detroit Lions",
+    "Packers": "Green Bay Packers",
+    "Panthers": "Carolina Panthers",
+    "Patriots": "New England Patriots",
+    "Raiders": "Las Vegas Raiders",
+    "Rams": "Los Angeles Rams",
+    "Ravens": "Baltimore Ravens",
+    "Saints": "New Orleans Saints",
+    "Seahawks": "Seattle Seahawks",
+    "Steelers": "Pittsburgh Steelers",
+    "Texans": "Houston Texans",
+    "Titans": "Tennessee Titans",
+    "Vikings": "Minnesota Vikings",
+}
+
+glog["Home Team"] = glog["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+glog["Away Team"] = glog["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+
+# ---------- contexts ----------
 off_means = off.drop(columns=["Team"]).mean()
-off_stds  = off.drop(columns=["Team"]).std().replace(0,1.0)
+off_stds  = off.drop(columns=["Team"]).std().replace(0, 1.0)
 def_means = defn.drop(columns=["Team"]).mean()
-def_stds  = defn.drop(columns=["Team"]).std().replace(0,1.0)
+def_stds  = defn.drop(columns=["Team"]).std().replace(0, 1.0)
 
 off_d = {r.Team: r for _, r in off.iterrows()}
 def_d = {r.Team: r for _, r in defn.iterrows()}
 teams = sorted(set(off["Team"]).intersection(defn["Team"]))
 
-def z_off(row, col): return (row[col] - off_means[col]) / off_stds[col]
-def inv_def(row, col): return -((row[col]-def_means[col])/def_stds[col])
+def z_off(row, col):  # offense per-game (higher=better)
+    return (row[col] - off_means[col]) / off_stds[col]
+
+def inv_def(row, col_allowed):  # defense allowed (lower=better) -> invert so higher=better
+    return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
 FEATURES = [
     "edge_pts","edge_pass","edge_rush","edge_tot",
@@ -392,7 +454,7 @@ FEATURES = [
     "edge_pass_minus_rush","edge_pts_combo","edge_tot_combo"
 ]
 
-def build_edges(h_off,a_off,h_def,a_def):
+def build_edges(h_off, a_off, h_def, a_def):
     x = {
         "edge_pts":  z_off(h_off,"PTS_perG") - inv_def(a_def,"PTS_perG_Allowed"),
         "edge_pass": z_off(h_off,"Pass_YDS_perG") - inv_def(a_def,"Pass_YDS_perG_Allowed"),
@@ -403,65 +465,111 @@ def build_edges(h_off,a_off,h_def,a_def):
         "edge_rush_def": inv_def(h_def,"Rush_YDS_perG_Allowed") - z_off(a_off,"Rush_YDS_perG"),
         "edge_tot_def":  inv_def(h_def,"Tot_YDS_perG_Allowed") - z_off(a_off,"Tot_YDS_perG"),
     }
-    x["edge_pass_minus_rush"] = x["edge_pass"]-x["edge_rush"]
-    x["edge_pts_combo"]       = x["edge_pts"]+x["edge_pts_def"]
-    x["edge_tot_combo"]       = x["edge_tot"]+x["edge_tot_def"]
+    x["edge_pass_minus_rush"] = x["edge_pass"] - x["edge_rush"]
+    x["edge_pts_combo"]       = x["edge_pts"]  + x["edge_pts_def"]
+    x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
     return x
 
-# ---- feature clipping ----
+# ---------- feature clipping (90th percentile of |edge|) ----------
 def learn_caps(df, cols, q=0.90):
-    return {c: float(np.nanpercentile(np.abs(df[c].values), q*100)) for c in cols}
-def clip_feats(d, caps):
-    return {k: float(np.clip(v, -caps.get(k,999), caps.get(k,999))) for k,v in d.items()}
+    caps = {}
+    for c in cols:
+        if c not in df.columns or df[c].dropna().empty:
+            caps[c] = 0.5
+            continue
+        cap = float(np.nanpercentile(np.abs(df[c].values), q*100))
+        if not np.isfinite(cap) or cap < 0.5:
+            cap = 0.5
+        caps[c] = cap
+    return caps
 
+def clip_feats(d, caps):
+    return {k: float(np.clip(v, -caps.get(k, 999),  caps.get(k, 999))) for k, v in d.items()}
+
+# ---------- training ----------
 @st.cache_resource(show_spinner=False)
 def train_or_load_model():
     if MODEL_PATH.exists():
         bundle = joblib.load(MODEL_PATH)
         return bundle["model"], bundle["caps"]
 
-    rows=[]
-    for _,g in glog.iterrows():
-        ht,at=str(g["Home Team"]).strip(),str(g["Away Team"]).strip()
-        if ht not in off_d or at not in off_d: continue
-        h_off,a_off,h_def,a_def=off_d[ht],off_d[at],def_d[ht],def_d[at]
-        edges=build_edges(h_off,a_off,h_def,a_def)
-        win=1 if g["Home Score"]>g["Away Score"] else 0
-        key="||".join(sorted([ht,at]))
-        rows.append({**edges,"home_win":win,"pair_key":key})
-    feat=pd.DataFrame(rows)
-    caps=learn_caps(feat,FEATURES,q=0.90)
-    for c in FEATURES: feat[c]=np.clip(feat[c],-caps[c],caps[c])
-    X=feat[FEATURES].values; y=feat["home_win"].values; groups=feat["pair_key"].values
-    oof=np.zeros(len(y))
-    gkf=GroupKFold(n_splits=5)
-    for tr,va in gkf.split(X,y,groups):
-        m=LogisticRegression(C=0.5,max_iter=1000,class_weight="balanced")
-        m.fit(X[tr],y[tr])
-        oof[va]=m.predict_proba(X[va])[:,1]
-    model=LogisticRegression(C=0.5,max_iter=1000,class_weight="balanced").fit(X,y)
-    joblib.dump({"model":model,"caps":caps},MODEL_PATH)
-    return model,caps
+    rows = []
+    for _, g in glog.iterrows():
+        ht, at = str(g["Home Team"]).strip(), str(g["Away Team"]).strip()
+        if ht not in off_d or at not in off_d or ht not in def_d or at not in def_d:
+            continue
+        h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
+        edges = build_edges(h_off, a_off, h_def, a_def)   # raw edges
+        win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
+        key = "||".join(sorted([ht, at]))
+        rows.append({**edges, "home_win": win, "pair_key": key})
 
-# -------- UI --------
-st.title("🏈 NFL Matchup Predictor")
+    if not rows:
+        st.error("No training rows built. Check team names in game log vs Offense/Defense CSVs.")
+        st.stop()
 
-clf,caps=train_or_load_model()
+    feat = pd.DataFrame(rows)
+    # ensure all feature columns exist
+    for c in FEATURES:
+        if c not in feat.columns:
+            feat[c] = 0.0
 
-home=st.selectbox("Home Team",teams)
-away=st.selectbox("Away Team",teams)
+    caps = learn_caps(feat, FEATURES, q=0.90)
 
-if home!=away:
-    h_off,a_off,h_def,a_def=off_d[home],off_d[away],def_d[home],def_d[away]
-    raw=build_edges(h_off,a_off,h_def,a_def)
-    x=clip_feats(raw,caps)
-    vec=pd.DataFrame([x])[FEATURES].values
-    prob_home=float(clf.predict_proba(vec)[0,1])
-    prob_away=1-prob_home
-    winner=home if prob_home>=prob_away else away
+    # clip features for training
+    for c in FEATURES:
+        feat[c] = np.clip(feat[c].values, -caps[c], caps[c])
 
-    st.subheader("Prediction")
-    st.success(f"Predicted Winner: {winner}")
-    st.metric(f"{home} Win Probability",f"{prob_home*100:.1f}%")
-    st.metric(f"{away} Win Probability",f"{prob_away*100:.1f}%")
+    X = feat[FEATURES].values
+    y = feat["home_win"].values
+    groups = feat["pair_key"].values
 
+    # group-aware OOF (for sanity; not displayed)
+    oof = np.zeros(len(y))
+    gkf = GroupKFold(n_splits=5)
+    for tr, va in gkf.split(X, y, groups):
+        m = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", solver="lbfgs")
+        m.fit(X[tr], y[tr])
+        oof[va] = m.predict_proba(X[va])[:, 1]
+    # (Metrics computed but not shown)
+    _ = {
+        "auc": float(roc_auc_score(y, oof)),
+        "log_loss": float(log_loss(y, oof, eps=1e-15)),
+        "brier": float(brier_score_loss(y, oof)),
+        "accuracy@0.5": float(accuracy_score(y, (oof>=0.5).astype(int))),
+        "n": int(len(y)),
+    }
+
+    model = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", solver="lbfgs")
+    model.fit(X, y)
+
+    joblib.dump({"model": model, "caps": caps}, MODEL_PATH)
+    return model, caps
+
+# ---------- UI ----------
+st.title("NFL Matchup Predictor")
+
+clf, caps = train_or_load_model()
+
+home = st.selectbox("Home Team", teams)
+away = st.selectbox("Away Team", teams)
+
+if home and away and home != away:
+    if home not in off_d or away not in off_d:
+        st.error("Missing team stats for one or both teams.")
+    else:
+        h_off, a_off = off_d[home], off_d[away]
+        h_def, a_def = def_d[home], def_d[away]
+        raw = build_edges(h_off, a_off, h_def, a_def)
+        x = clip_feats(raw, caps)
+        vec = pd.DataFrame([x])[FEATURES].values
+        prob_home = float(clf.predict_proba(vec)[0, 1])
+        prob_away = 1.0 - prob_home
+        winner = home if prob_home >= prob_away else away
+
+        st.subheader("Prediction")
+        st.success(f"Predicted Winner: {winner}")
+        st.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
+        st.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
+elif home == away:
+    st.warning("Please select two different teams.")
