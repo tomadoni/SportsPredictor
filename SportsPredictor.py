@@ -304,9 +304,9 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, group-aware CV, calibrated, clipped
+# 🏈 NFL Matchup Predictor — CSV-only, header-normalized, group-aware CV, calibrated, clipped
 # =========================
-import os, glob
+import os, glob, re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -337,7 +337,7 @@ st.caption(f"🔎 Offense CSV: `{OFF_PATH}`")
 st.caption(f"🔎 Defense CSV: `{DEF_PATH}`")
 st.caption(f"🔎 Game Log CSV: `{LOG_PATH}`")
 
-# -------- load CSVs with validation --------
+# -------- load CSVs --------
 if not OFF_PATH or not DEF_PATH or not LOG_PATH:
     st.error("Missing files. Ensure these exist (in app folder or `data/`): "
              "`NFL_Offense.csv`, `NFL_Defense.csv`, `NFL_Game_log.csv`.")
@@ -347,11 +347,60 @@ off = pd.read_csv(OFF_PATH)
 defn = pd.read_csv(DEF_PATH)
 glog = pd.read_csv(LOG_PATH)
 
-# normalize headers (trim whitespace)
-off.columns = [c.strip() for c in off.columns]
+# ---------- Normalize & auto-rename headers ----------
+def _canonize_name(s: str) -> str:
+    s = re.sub(r"\s+", " ", str(s).strip())
+    s = s.lower()
+    s = s.replace("%", "pct")
+    s = re.sub(r"[/\-]", " ", s)
+    s = re.sub(r"[^0-9a-z]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
+    # map normalized name -> original
+    norm2orig = { _canonize_name(c): c for c in df.columns }
+
+    def pick(*cands):
+        for c in cands:
+            if c in norm2orig: return norm2orig[c]
+        return None
+
+    # Common aliases
+    team_col  = pick("team","teams")
+    tot_perg  = pick("tot_yds_perg","total_yds_perg","yds_g","yds_perg","total_yards_per_game","total_yds_g","total_yds_game")
+    pass_perg = pick("pass_yds_perg","passing_yds_perg","pass_yds_g","passing_yards_per_game","pass_yards_g","pass_yards_per_game")
+    rush_perg = pick("rush_yds_perg","rushing_yds_perg","rush_yds_g","rushing_yards_per_game","rush_yards_g","rush_yards_per_game")
+    pts_perg  = pick("pts_perg","points_per_game","pts_g","points_g")
+
+    rename_map = {}
+    if team_col:  rename_map[team_col]  = "Team"
+
+    if is_defense:
+        if tot_perg:  rename_map[tot_perg]  = "Tot_YDS_perG_Allowed"
+        if pass_perg: rename_map[pass_perg] = "Pass_YDS_perG_Allowed"
+        if rush_perg: rename_map[rush_perg] = "Rush_YDS_perG_Allowed"
+        if pts_perg:  rename_map[pts_perg]  = "PTS_perG_Allowed"
+    else:
+        if tot_perg:  rename_map[tot_perg]  = "Tot_YDS_perG"
+        if pass_perg: rename_map[pass_perg] = "Pass_YDS_perG"
+        if rush_perg: rename_map[rush_perg] = "Rush_YDS_perG"
+        if pts_perg:  rename_map[pts_perg]  = "PTS_perG"
+
+    df = df.rename(columns=rename_map)
+
+    with st.expander(("Defense" if is_defense else "Offense") + " column mapping"):
+        st.write(rename_map)
+    return df
+
+# Apply auto-rename, then trim whitespace
+off = _auto_rename(off, is_defense=False)
+defn = _auto_rename(defn, is_defense=True)
+off.columns  = [c.strip() for c in off.columns]
 defn.columns = [c.strip() for c in defn.columns]
 glog.columns = [c.strip() for c in glog.columns]
 
+# -------- validate expected columns --------
 off_req = {"Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"}
 def_req = {"Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"}
 log_req = {"Home Team","Away Team","Home Score","Away Score"}
@@ -361,8 +410,8 @@ if not off_req.issubset(off.columns): missing.append(f"Offense CSV missing: {off
 if not def_req.issubset(defn.columns): missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
 if not log_req.issubset(glog.columns): missing.append(f"Game log CSV missing: {log_req - set(glog.columns)}")
 if missing:
-    st.error("Column mismatch:\n- " + "\n- ".join(missing))
-    with st.expander("Preview files"):
+    st.error("Column mismatch after auto-rename:\n- " + "\n- ".join(missing))
+    with st.expander("Preview files (post-rename)"):
         st.write("Offense head:", off.head())
         st.write("Defense head:", defn.head())
         st.write("Game log head:", glog.head())
@@ -410,7 +459,7 @@ def build_feature_dict(h_off, a_off, h_def, a_def):
     x["edge_tot_combo"]       = x["edge_tot"]  + x["edge_tot_def"]
     return x
 
-# nickname → full team name (for training alignment)
+# nickname → full team name (for aligning game log names)
 NAME_MAP = {
     "49ers":"San Francisco 49ers","Niners":"San Francisco 49ers","Bears":"Chicago Bears","Lions":"Detroit Lions",
     "Packers":"Green Bay Packers","Vikings":"Minnesota Vikings","Cowboys":"Dallas Cowboys","Giants":"New York Giants",
@@ -418,9 +467,10 @@ NAME_MAP = {
     "Cardinals":"Arizona Cardinals","Saints":"New Orleans Saints","Buccaneers":"Tampa Bay Buccaneers","Bucs":"Tampa Bay Buccaneers",
     "Falcons":"Atlanta Falcons","Panthers":"Carolina Panthers",
     "Bills":"Buffalo Bills","Dolphins":"Miami Dolphins","Patriots":"New England Patriots","Jets":"New York Jets",
-    "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cleveland Browns","Steelers":"Pittsburgh Steelers",
-    "Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars","Titans":"Tennessee Titans",
-    "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
+    "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cincinnati Browns" if False else "Cleveland Browns",  # guard
+    "Steelers":"Pittsburgh Steelers","Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars",
+    "Titans":"Tennessee Titans","Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders",
+    "Chargers":"Los Angeles Chargers",
 }
 
 # -------- group-aware OOF with calibrated RF (no leakage by matchup) --------
@@ -485,7 +535,7 @@ def train_or_load_model():
             n_jobs=-1,
         )
 
-        # Group-aware OOF probs for honest metrics (no same-pair leakage)
+        # Group-aware OOF probs for honest metrics
         oof = _oof_calibrated_proba_grouped(Xv, y, groups, rf_params, n_splits=5, seed=42)
         y_hat = (oof >= 0.5).astype(int)
         metrics = {
@@ -503,10 +553,7 @@ def train_or_load_model():
         cal_full.fit(Xv, y)
 
         seen_pairs = set(feat["pair_key"].unique())
-        joblib.dump(
-            {"model": cal_full, "feature_columns": ALL_FEATURES, "seen_pairs": seen_pairs},
-            MODEL_PATH
-        )
+        joblib.dump({"model": cal_full, "feature_columns": ALL_FEATURES, "seen_pairs": seen_pairs}, MODEL_PATH)
         pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
         return cal_full, ALL_FEATURES, seen_pairs, metrics
 
@@ -541,14 +588,13 @@ if home_team and away_team:
         try:
             x = build_feature_dict(h_off, a_off, h_def, a_def)
         except KeyError as e:
-            st.error(f"Missing column `{e.args[0]}` in Off/Def tables.")
-            with st.expander("Available columns"):
+            st.error(f"Missing expected column `{e.args[0]}` after auto-rename.")
+            with st.expander("Available offense/defense columns now"):
                 st.write("Offense:", list(off.columns))
                 st.write("Defense:", list(defn.columns))
             st.stop()
 
         vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
-
         prob_home = predict_proba_clipped(clf, vec, clip_low=clip_low, clip_high=clip_high)
         prob_away = 1.0 - prob_home
         winner = home_team if prob_home >= prob_away else away_team
