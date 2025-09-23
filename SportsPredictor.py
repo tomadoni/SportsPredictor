@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, header-normalized, group-aware CV, calibrated, clipped
+# 🏈 NFL Matchup Predictor — CSV-only, header-normalized, group-aware CV, calibrated, capped confidence
 # =========================
 import os, glob, re
 import numpy as np
@@ -358,7 +358,6 @@ def _canonize_name(s: str) -> str:
     return s
 
 def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
-    # map normalized name -> original
     norm2orig = { _canonize_name(c): c for c in df.columns }
 
     def pick(*cands):
@@ -366,7 +365,7 @@ def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
             if c in norm2orig: return norm2orig[c]
         return None
 
-    # Common aliases
+    # Common aliases -> canonical
     team_col  = pick("team","teams")
     tot_perg  = pick("tot_yds_perg","total_yds_perg","yds_g","yds_perg","total_yards_per_game","total_yds_g","total_yds_game")
     pass_perg = pick("pass_yds_perg","passing_yds_perg","pass_yds_g","passing_yards_per_game","pass_yards_g","pass_yards_per_game")
@@ -442,7 +441,6 @@ EXTRA_FEATURES = ["edge_pass_minus_rush","edge_pts_combo","edge_tot_combo"]
 ALL_FEATURES = BASE_FEATURES + EXTRA_FEATURES
 
 def build_feature_dict(h_off, a_off, h_def, a_def):
-    # explicit, correct column names
     x = {
         "edge_pts":  z_off(h_off, "PTS_perG")        - inv_def(a_def, "PTS_perG_Allowed"),
         "edge_pass": z_off(h_off, "Pass_YDS_perG")   - inv_def(a_def, "Pass_YDS_perG_Allowed"),
@@ -467,10 +465,9 @@ NAME_MAP = {
     "Cardinals":"Arizona Cardinals","Saints":"New Orleans Saints","Buccaneers":"Tampa Bay Buccaneers","Bucs":"Tampa Bay Buccaneers",
     "Falcons":"Atlanta Falcons","Panthers":"Carolina Panthers",
     "Bills":"Buffalo Bills","Dolphins":"Miami Dolphins","Patriots":"New England Patriots","Jets":"New York Jets",
-    "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cincinnati Browns" if False else "Cleveland Browns",  # guard
-    "Steelers":"Pittsburgh Steelers","Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars",
-    "Titans":"Tennessee Titans","Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders",
-    "Chargers":"Los Angeles Chargers",
+    "Ravens":"Baltimore Ravens","Bengals":"Cincinnati Bengals","Browns":"Cleveland Browns","Steelers":"Pittsburgh Steelers",
+    "Texans":"Houston Texans","Colts":"Indianapolis Colts","Jaguars":"Jacksonville Jaguars","Titans":"Tennessee Titans",
+    "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
 }
 
 # -------- group-aware OOF with calibrated RF (no leakage by matchup) --------
@@ -557,18 +554,37 @@ def train_or_load_model():
         pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
         return cal_full, ALL_FEATURES, seen_pairs, metrics
 
-def predict_proba_clipped(clf, vec, clip_low=0.10, clip_high=0.90):
-    """Clip probabilities into [clip_low, clip_high] to avoid overconfident outputs."""
+def predict_proba_with_limit(clf, vec, limit=0.30):
+    """
+    Enforce symmetric max deviation from 0.5.
+    Example: limit=0.30 → p in [0.20, 0.80].
+    """
     p = float(clf.predict_proba(vec)[0, 1])
-    return float(np.clip(p, clip_low, clip_high))
+    lo, hi = 0.5 - limit, 0.5 + limit
+    if p < lo: return lo
+    if p > hi: return hi
+    return p
 
-# -------- Streamlit UI --------
-st.title("🏈 NFL Matchup Predictor (CSV-only, group-aware CV, clipped)")
-st.caption("RF (regularized) + sigmoid calibration. GroupKFold by matchup prevents leakage; outputs are clipped.")
+# -------- UI --------
+st.title("🏈 NFL Matchup Predictor (CSV-only, group-aware CV, capped confidence)")
+st.caption("RF (regularized) + sigmoid calibration. GroupKFold by matchup prevents leakage; outputs capped around 50/50.")
 
-with st.expander("⚙️ Probability clipping"):
-    clip_low = st.slider("Minimum probability", 0.00, 0.30, 0.10, 0.01)
-    clip_high = st.slider("Maximum probability", 0.70, 1.00, 0.90, 0.01)
+with st.expander("⚙️ Probability cap (max confidence)"):
+    limit = st.slider(
+        "Max deviation from 50/50",
+        0.05, 0.45, 0.30, 0.01,
+        help="Sets the furthest a probability may move away from 0.5. 0.30 → 20–80; 0.25 → 25–75."
+    )
+    stricter_seen = st.checkbox(
+        "Use stricter cap for seen matchups",
+        value=True,
+        help="If a pair existed in training, clamp closer to 50/50."
+    )
+    limit_seen = st.slider(
+        "Max deviation for seen matchups",
+        0.05, 0.45, 0.25, 0.01,
+        help="Only used when 'stricter cap' is enabled."
+    )
 
 clf, feature_columns, seen_pairs, cv_metrics = train_or_load_model()
 
@@ -595,7 +611,12 @@ if home_team and away_team:
             st.stop()
 
         vec = pd.DataFrame([{k: x[k] for k in feature_columns}]).values
-        prob_home = predict_proba_clipped(clf, vec, clip_low=clip_low, clip_high=clip_high)
+
+        # Apply limit (stricter for seen pairs, if selected)
+        pair_key_ui = "||".join(sorted([home_team, away_team]))
+        this_limit = limit_seen if (stricter_seen and pair_key_ui in seen_pairs) else limit
+
+        prob_home = predict_proba_with_limit(clf, vec, limit=this_limit)
         prob_away = 1.0 - prob_home
         winner = home_team if prob_home >= prob_away else away_team
 
@@ -605,7 +626,6 @@ if home_team and away_team:
         c3.metric(f"{home_team} Win Probability", f"{prob_home*100:.1f}%")
         c4.metric(f"{away_team} Win Probability", f"{prob_away*100:.1f}%")
 
-        pair_key_ui = "||".join(sorted([home_team, away_team]))
         if pair_key_ui in seen_pairs:
             st.info("ℹ️ This matchup pair exists in the training data. Group-aware CV prevents overconfident repeats.")
 
@@ -615,6 +635,7 @@ if home_team and away_team:
         if cv_metrics:
             with st.expander("Model CV metrics (group-aware OOF)"):
                 st.write(cv_metrics)
+
 
 
 
