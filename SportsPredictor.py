@@ -304,7 +304,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — CSV-only, auto-trains if no saved model
+# 🏈 NFL Matchup Predictor — CSV-only, fast, calibrated, with probability tempering
 # =========================
 import os, glob
 import numpy as np
@@ -312,9 +312,9 @@ import pandas as pd
 import streamlit as st
 import joblib
 from pathlib import Path
+from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, brier_score_loss
 
 # -------- file finder (supports data/ subfolder) --------
@@ -379,7 +379,7 @@ def z_off(row, col):  # offense per-G (higher = better)
 def inv_def(row, col_allowed):  # defense allowed (lower = better) -> invert so higher is better
     return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
-# -------- feature engineering --------
+# -------- features --------
 BASE_FEATURES = [
     "edge_pts","edge_pass","edge_rush","edge_tot",
     "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
@@ -416,67 +416,114 @@ NAME_MAP = {
     "Broncos":"Denver Broncos","Chiefs":"Kansas City Chiefs","Raiders":"Las Vegas Raiders","Chargers":"Los Angeles Chargers",
 }
 
-# -------- train-or-load (no external training script) --------
-def train_from_gamelog():
-    gl = glog.copy()
-    gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
-    gl["Away Team"] = gl["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+# -------- fast CV with calibrated RF (no nested CV) --------
+def _oof_calibrated_proba(X, y, rf_params, n_splits=5, seed=42):
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof = np.zeros(len(y), dtype=float)
+    for tr_idx, va_idx in skf.split(X, y):
+        X_tr, X_va = X[tr_idx], X[va_idx]
+        y_tr = y[tr_idx]
 
-    rows = []
-    for _, g in gl.iterrows():
-        ht = str(g["Home Team"]).strip()
-        at = str(g["Away Team"]).strip()
-        if ht not in off_d or ht not in def_d or at not in off_d or at not in def_d:
-            continue
-        h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
-        x = build_feature_dict(h_off, a_off, h_def, a_def)
-        home_win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
-        rows.append({**x, "home_win": home_win})
+        rf = RandomForestClassifier(**rf_params, random_state=seed)
+        rf.fit(X_tr, y_tr)
 
-    feat = pd.DataFrame(rows)
-    if len(feat) < 25:
-        st.error("Not enough rows from the game log to train the NFL model. Check team names/scores.")
-        st.stop()
+        cal = CalibratedClassifierCV(rf, method="sigmoid", cv="prefit")
+        cal.fit(X_tr, y_tr)
 
-    X = feat.drop(columns=["home_win"]).copy()
-    X = X[ALL_FEATURES]
-    y = feat["home_win"].values
+        oof[va_idx] = cal.predict_proba(X_va)[:, 1]
+    return oof
 
-    rf = RandomForestClassifier(
-        n_estimators=900, max_features="sqrt", min_samples_leaf=2, random_state=42
-    )
-    model = CalibratedClassifierCV(rf, method="isotonic", cv=5)
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    y_prob = cross_val_predict(model, X.values, y, cv=cv, method="predict_proba")[:, 1]
-    y_hat  = (y_prob >= 0.5).astype(int)
-
-    metrics = {
-        "auc": float(roc_auc_score(y, y_prob)),
-        "log_loss": float(log_loss(y, y_prob)),
-        "brier": float(brier_score_loss(y, y_prob)),
-        "accuracy@0.5": float(accuracy_score(y, y_hat)),
-        "n": int(len(y)),
-    }
-
-    model.fit(X.values, y)
-    joblib.dump({"model": model, "feature_columns": ALL_FEATURES}, MODEL_PATH)
-    pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
-    return model, metrics
-
-def load_or_train():
+@st.cache_resource(show_spinner=False)
+def train_or_load_model(feat_df: pd.DataFrame):
+    # load if available
     if MODEL_PATH.exists():
         bundle = joblib.load(MODEL_PATH)
-        model = bundle["model"]
         metrics = pd.read_csv(METRICS_CSV).iloc[0].to_dict() if METRICS_CSV.exists() else None
-        return model, metrics
-    return train_from_gamelog()
+        return bundle["model"], metrics
 
-clf, cv_metrics = load_or_train()
+    with st.spinner("Training NFL classifier (RF + sigmoid calibration)…"):
+        # build training frame from game log
+        gl = glog.copy()
+        gl["Home Team"] = gl["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+        gl["Away Team"] = gl["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
+
+        rows = []
+        for _, g in gl.iterrows():
+            ht = str(g["Home Team"]).strip()
+            at = str(g["Away Team"]).strip()
+            if ht not in off_d or ht not in def_d or at not in off_d or at not in def_d:
+                continue
+            h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
+            x = build_feature_dict(h_off, a_off, h_def, a_def)
+            home_win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
+            rows.append({**x, "home_win": home_win})
+
+        feat = pd.DataFrame(rows)
+        if len(feat) < 25:
+            st.error("Not enough rows from the game log to train the NFL model. Check team names/scores.")
+            st.stop()
+
+        X = feat.drop(columns=["home_win"]).copy()
+        X = X[ALL_FEATURES]  # enforce order
+        y = feat["home_win"].values
+        Xv = X.values
+
+        rf_params = dict(
+            n_estimators=300,
+            max_depth=12,
+            min_samples_leaf=5,
+            min_samples_split=10,
+            max_features="sqrt",
+            class_weight="balanced_subsample",
+            n_jobs=-1,  # speed
+        )
+
+        # OOF probs for honest metrics
+        oof = _oof_calibrated_proba(Xv, y, rf_params, n_splits=5, seed=42)
+        y_hat = (oof >= 0.5).astype(int)
+
+        metrics = {
+            "auc": float(roc_auc_score(y, oof)),
+            "log_loss": float(log_loss(y, oof, eps=1e-15)),
+            "brier": float(brier_score_loss(y, oof)),
+            "accuracy@0.5": float(accuracy_score(y, y_hat)),
+            "n": int(len(y)),
+        }
+
+        # Fit on full data + calibrate
+        rf_full = RandomForestClassifier(**rf_params, random_state=42)
+        rf_full.fit(Xv, y)
+        cal_full = CalibratedClassifierCV(rf_full, method="sigmoid", cv="prefit")
+        cal_full.fit(Xv, y)
+
+        joblib.dump({"model": cal_full, "feature_columns": ALL_FEATURES}, MODEL_PATH)
+        pd.DataFrame([metrics]).to_csv(METRICS_CSV, index=False)
+        return cal_full, metrics
+
+def predict_proba_tempered(clf, vec, clip_low=0.05, clip_high=0.95, shrink=0.85):
+    """
+    Temper probabilities to avoid overconfident extremes:
+      1) clip to [clip_low, clip_high]
+      2) shrink toward 0.5: p' = 0.5 + (p - 0.5) * shrink
+    """
+    p = float(clf.predict_proba(vec)[0, 1])
+    p = float(np.clip(p, clip_low, clip_high))
+    p = 0.5 + (p - 0.5) * float(shrink)
+    return p
 
 # -------- Streamlit UI --------
-st.title("🏈 NFL Matchup Predictor (CSV-only, auto-trains)")
-st.caption("Random Forest + isotonic calibration trained from your game log and team OFF/DEF per-game stats.")
+st.title("🏈 NFL Matchup Predictor (CSV-only, calibrated, tempered)")
+st.caption("RF (regularized) + sigmoid calibration. Probabilities clipped & optionally shrunk toward 50/50.")
+
+# Tempering controls
+with st.expander("⚙️ Probability tempering"):
+    clip_low = st.slider("Minimum probability", 0.00, 0.20, 0.05, 0.01, help="Lower bound for any team's win prob.")
+    clip_high = st.slider("Maximum probability", 0.80, 1.00, 0.95, 0.01, help="Upper bound for any team's win prob.")
+    shrink = st.slider("Shrink toward 50/50", 0.00, 1.00, 0.85, 0.05,
+                       help="1.0 = no shrink; 0.0 = force 50/50. Pulls extreme matchups closer to even.")
+
+# Train/load once
+clf, cv_metrics = train_or_load_model(glog)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -494,7 +541,7 @@ if home_team and away_team:
         x = build_feature_dict(h_off, a_off, h_def, a_def)
         vec = pd.DataFrame([{k: x[k] for k in ALL_FEATURES}]).values
 
-        prob_home = float(clf.predict_proba(vec)[0, 1])
+        prob_home = predict_proba_tempered(clf, vec, clip_low=clip_low, clip_high=clip_high, shrink=shrink)
         prob_away = 1.0 - prob_home
         winner = home_team if prob_home >= prob_away else away_team
 
@@ -508,8 +555,9 @@ if home_team and away_team:
             st.json({k: f"{x[k]:+.3f}" for k in ALL_FEATURES})
 
         if cv_metrics:
-            with st.expander("Model CV metrics"):
+            with st.expander("Model CV metrics (OOF)"):
                 st.write(cv_metrics)
+
 
 
 
