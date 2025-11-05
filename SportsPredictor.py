@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
-st.set_page_config(page_title="NBA Matchup Predictor (No Log)", layout="centered")
+st.set_page_config(page_title="NBA Matchup Predictor", layout="centered")
 
 # ---------- file finder ----------
 def _find_one(possibles):
@@ -192,7 +192,7 @@ def score_from_edges(ed, weights, bias=0.0):
     return float(s)
 
 # ---------- UI ----------
-st.title("NBA Matchup Predictor (No Game Log)")
+st.title("NBA Matchup Predictor")
 st.caption("Prior-based model using offense vs defense ‘stat edges’. Tune weights & home-court in the sidebar.")
 
 with st.sidebar:
