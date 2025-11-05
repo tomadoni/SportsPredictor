@@ -9,97 +9,252 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, r2_score, log_loss, brier_score_loss, roc_auc_score
 import matplotlib.pyplot as plt
 
-# NBA
-# --- Load Data ---
-matchup_df = pd.read_csv("NBA_Matchup_Training_Data_with_Home.csv")
-team_stats = pd.read_csv("Full_NBA_Team_Stats.csv")
+# =========================
+# 🏀 NBA Matchup Predictor — No game log (prior-based, tunable)
+# =========================
+import glob, re
+import numpy as np
+import pandas as pd
+import streamlit as st
+from pathlib import Path
 
-# --- Flip and Scale Home Indicator ---
-matchup_df['home_indicator'] *= -3.0  # Flipping the sign and amplifying
+st.set_page_config(page_title="NBA Matchup Predictor (No Log)", layout="centered")
 
-# --- Define Features ---
-raw_features = ['FG%', '3P%', 'REB', '3P%_def', 'REB_def']
-diff_features = ['diff_' + f for f in raw_features]
-model_features = diff_features + ['home_indicator']
+# ---------- file finder ----------
+def _find_one(possibles):
+    for p in possibles:
+        hits = glob.glob(p)
+        if hits:
+            return hits[0]
+    return None
 
-# --- Separate features ---
-X_stats = matchup_df[diff_features]
-X_home = matchup_df[['home_indicator']]
-y = matchup_df["Winner"]
+OFF_PATH = _find_one(["NBA_Offense.csv", "data/NBA_Offense.csv"])
+DEF_PATH = _find_one(["NBA_Defense.csv", "data/NBA_Defense.csv"])
 
-# --- Scale stat features only ---
-scaler = StandardScaler()
-X_stats_scaled = scaler.fit_transform(X_stats)
+if not OFF_PATH or not DEF_PATH:
+    st.error("Missing NBA CSV files (`NBA_Offense.csv`, `NBA_Defense.csv`).")
+    st.stop()
 
-# --- Combine scaled stats with unscaled home_indicator ---
-X_combined = np.hstack([X_stats_scaled, X_home.values])
+# ---------- canonicalize ----------
+def _canonize_name(s: str) -> str:
+    s = re.sub(r"\s+", " ", str(s).strip()).lower()
+    s = s.replace("%", "pct")
+    s = s.replace("3p", "threep").replace("3-pt", "threep").replace("3 pt", "threep")
+    s = re.sub(r"[/\\\-]", " ", s)
+    s = re.sub(r"[^0-9a-z]+", "_", s)
+    return re.sub(r"_+", "_", s).strip("_")
 
-# --- Train/Test Split ---
-X_train, X_test, y_train, y_test = train_test_split(
-    X_combined, y, test_size=0.2, random_state=42, stratify=y
+def _auto_rename_nba(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
+    norm2orig = {_canonize_name(c): c for c in df.columns}
+
+    def pick(*cands):
+        for c in cands:
+            if c in norm2orig:
+                return norm2orig[c]
+        return None
+
+    team_col   = pick("team","teams","franchise","club","squad")
+    pts_perg   = pick("pts_perg","points_per_game","pts_g","ppg")
+    fg_pct     = pick("fg_pct","field_goal_pct","field_goals_pct","fgp")
+    threep_pct = pick("threep_pct","three_point_pct","three_point_percentage","3p_pct","3pt_pct")
+    reb_perg   = pick("reb_perg","rebounds_per_game","rebs_perg","rpg","trb_perg","trb_g")
+
+    rn = {}
+    if team_col: rn[team_col] = "Team"
+    if is_defense:
+        if pts_perg:   rn[pts_perg]   = "PTS_perG_Allowed"
+        if fg_pct:     rn[fg_pct]     = "FG_pct_Allowed"
+        if threep_pct: rn[threep_pct] = "ThreeP_pct_Allowed"
+        if reb_perg:   rn[reb_perg]   = "REB_perG_Allowed"
+    else:
+        if pts_perg:   rn[pts_perg]   = "PTS_perG"
+        if fg_pct:     rn[fg_pct]     = "FG_pct"
+        if threep_pct: rn[threep_pct] = "ThreeP_pct"
+        if reb_perg:   rn[reb_perg]   = "REB_perG"
+    return df.rename(columns=rn)
+
+@st.cache_data(show_spinner=False)
+def load_frames():
+    off = pd.read_csv(OFF_PATH)
+    de  = pd.read_csv(DEF_PATH)
+    off = _auto_rename_nba(off, is_defense=False)
+    de  = _auto_rename_nba(de,  is_defense=True)
+    return off, de
+
+off, defn = load_frames()
+
+# ---------- validate ----------
+off_req = {"Team","PTS_perG","FG_pct","ThreeP_pct","REB_perG"}
+def_req = {"Team","PTS_perG_Allowed","FG_pct_Allowed","ThreeP_pct_Allowed","REB_perG_Allowed"}
+
+missing = []
+if not off_req.issubset(off.columns): missing.append(f"Offense CSV missing: {off_req - set(off.columns)}")
+if not def_req.issubset(defn.columns): missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
+if missing:
+    st.error("Column mismatch:\n- " + "\n- ".join(missing))
+    st.stop()
+
+# ---------- contexts ----------
+off_means = off.drop(columns=["Team"]).mean(numeric_only=True)
+off_stds  = off.drop(columns=["Team"]).std(numeric_only=True).replace(0, 1.0)
+def_means = defn.drop(columns=["Team"]).mean(numeric_only=True)
+def_stds  = defn.drop(columns=["Team"]).std(numeric_only=True).replace(0, 1.0)
+
+off_d = {r.Team: r for _, r in off.iterrows()}
+def_d = {r.Team: r for _, r in defn.iterrows()}
+teams = sorted(set(off["Team"]).intersection(defn["Team"]))
+
+def z_off(row, col):  # offense (higher=better)
+    return float((row[col] - off_means[col]) / off_stds[col])
+
+def inv_def(row, col_allowed):  # defense allowed (lower=better) -> invert so higher=better
+    return float(-((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed]))
+
+FEATURES = [
+    "edge_pts","edge_fg","edge_3p","edge_reb",
+    "edge_pts_def","edge_fg_def","edge_3p_def","edge_reb_def",
+    "edge_shooting_gap","edge_pts_combo","edge_reb_combo"
+]
+
+def build_edges(h_off, a_off, h_def, a_def):
+    x = {
+        "edge_pts":  z_off(h_off,"PTS_perG")   - inv_def(a_def,"PTS_perG_Allowed"),
+        "edge_fg":   z_off(h_off,"FG_pct")     - inv_def(a_def,"FG_pct_Allowed"),
+        "edge_3p":   z_off(h_off,"ThreeP_pct") - inv_def(a_def,"ThreeP_pct_Allowed"),
+        "edge_reb":  z_off(h_off,"REB_perG")   - inv_def(a_def,"REB_perG_Allowed"),
+
+        "edge_pts_def":  inv_def(h_def,"PTS_perG_Allowed")    - z_off(a_off,"PTS_perG"),
+        "edge_fg_def":   inv_def(h_def,"FG_pct_Allowed")      - z_off(a_off,"FG_pct"),
+        "edge_3p_def":   inv_def(h_def,"ThreeP_pct_Allowed")  - z_off(a_off,"ThreeP_pct"),
+        "edge_reb_def":  inv_def(h_def,"REB_perG_Allowed")    - z_off(a_off,"REB_perG"),
+    }
+    x["edge_shooting_gap"] = x["edge_fg"] + x["edge_3p"]
+    x["edge_pts_combo"]    = x["edge_pts"] + x["edge_pts_def"]
+    x["edge_reb_combo"]    = x["edge_reb"] + x["edge_reb_def"]
+    return x
+
+# ---------- clipping ----------
+def learn_caps_from_grid(teams, default_cap=0.5, q=0.90):
+    rows = []
+    for h in teams:
+        for a in teams:
+            if h == a: continue
+            h_off, a_off = off_d[h], off_d[a]
+            h_def, a_def = def_d[h], def_d[a]
+            rows.append(build_edges(h_off, a_off, h_def, a_def))
+    df = pd.DataFrame(rows)
+    caps = {}
+    for c in FEATURES:
+        if c not in df or df[c].dropna().empty:
+            caps[c] = default_cap
+            continue
+        cap = float(np.nanpercentile(np.abs(df[c].values), int(q*100)))
+        if not np.isfinite(cap) or cap < default_cap:
+            cap = default_cap
+        caps[c] = cap
+    return caps
+
+@st.cache_data(show_spinner=False)
+def get_caps():
+    return learn_caps_from_grid(teams, default_cap=0.5, q=0.90)
+
+CAPS = get_caps()
+
+def clip_feats(d):
+    return {k: float(np.clip(v, -CAPS.get(k, 999), CAPS.get(k, 999))) for k, v in d.items()}
+
+# ---------- prior-based scoring (no training) ----------
+DEFAULT_WEIGHTS = {
+    # offense vs opp D
+    "edge_pts": 0.45,
+    "edge_fg":  0.25,
+    "edge_3p":  0.20,
+    "edge_reb": 0.10,
+    # defense vs opp O
+    "edge_pts_def": 0.30,
+    "edge_fg_def":  0.15,
+    "edge_3p_def":  0.15,
+    "edge_reb_def": 0.10,
+    # composites
+    "edge_shooting_gap": 0.15,
+    "edge_pts_combo":    0.20,
+    "edge_reb_combo":    0.05,
+}
+
+def logistic(x, k=1.35):  # temperature k controls sharpness
+    return 1.0 / (1.0 + np.exp(-k * x))
+
+def score_from_edges(ed, weights, bias=0.0):
+    # Weighted sum over clipped edges
+    s = bias
+    for f, w in weights.items():
+        s += w * ed.get(f, 0.0)
+    return float(s)
+
+# ---------- UI ----------
+st.title("NBA Matchup Predictor (No Game Log)")
+st.caption("Prior-based model using offense vs defense ‘stat edges’. Tune weights & home-court in the sidebar.")
+
+with st.sidebar:
+    st.header("Model Settings")
+    hca = st.slider("Home-court advantage (edge units)", 0.00, 0.80, 0.20, 0.01)
+    temp = st.slider("Sigmoid temperature (k)", 0.50, 3.00, 1.35, 0.05)
+
+    st.subheader("Weights (click to expand)")
+    with st.expander("Adjust feature weights", expanded=False):
+        w = {}
+        for key in DEFAULT_WEIGHTS:
+            w[key] = st.slider(key, -1.00, 1.50, float(DEFAULT_WEIGHTS[key]), 0.05)
+    st.markdown("---")
+    st.caption("Tip: Increase shooting weights (FG/3P) for pace/spacing eras; increase REB for physical matchups.")
+
+home = st.selectbox("Home Team", teams, index=0)
+away = st.selectbox("Away Team", [t for t in teams if t != home], index=0)
+
+if home and away and home != away:
+    h_off, a_off = off_d[home], off_d[away]
+    h_def, a_def = def_d[home], def_d[away]
+    raw = build_edges(h_off, a_off, h_def, a_def)
+    x = clip_feats(raw)
+
+    # base edge (home perspective)
+    base_score = score_from_edges(x, w if 'w' in locals() else DEFAULT_WEIGHTS, bias=0.0)
+
+    # symmetric check: approximate away edge by flipping home/away
+    raw_rev = build_edges(a_off, h_off, a_def, h_def)
+    x_rev = clip_feats(raw_rev)
+    away_base = score_from_edges(x_rev, w if 'w' in locals() else DEFAULT_WEIGHTS, bias=0.0)
+
+    # ensure antisymmetry by averaging (optional, helps stability)
+    sym_score = 0.5 * (base_score - away_base)
+
+    # add home-court advantage
+    sym_score += hca
+
+    prob_home = float(logistic(sym_score, k=temp))
+    prob_away = 1.0 - prob_home
+    winner = home if prob_home >= prob_away else away
+
+    st.subheader("Prediction")
+    st.success(f"Predicted Winner: {winner}")
+    c1, c2 = st.columns(2)
+    c1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
+    c2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
+
+    with st.expander("Feature edges (clipped)"):
+        st.dataframe(pd.DataFrame([x]).T.rename(columns={0:"value"}))
+
+else:
+    st.info("Select two different teams.")
+
+st.markdown(
+    """
+    **Notes**
+    - No game log needed: probabilities come from standardized offense vs defense edges and a tunable sigmoid.
+    - Use the sidebar to calibrate weights or home-court advantage to your era/data source.
+    """
 )
 
-# --- Train Calibrated Logistic Regression Model ---
-lr = LogisticRegression(max_iter=500, C=0.1, solver='lbfgs', random_state=42)
-model = CalibratedClassifierCV(estimator=lr, method='sigmoid', cv=5)
-model.fit(X_train, y_train)
-
-# --- Extract Feature Importance ---
-coef = model.calibrated_classifiers_[0].estimator.coef_[0]
-feature_importance_df = pd.DataFrame({
-    "Feature": model_features,
-    "Coefficient": coef
-}).sort_values(by="Coefficient", ascending=False)
-
-# --- Model Evaluation ---
-y_pred_train = model.predict(X_train)
-y_pred_test = model.predict(X_test)
-train_acc = accuracy_score(y_train, y_pred_train)
-test_acc = accuracy_score(y_test, y_pred_test)
-train_r2 = r2_score(y_train, y_pred_train)
-test_r2 = r2_score(y_test, y_pred_test)
-logloss = log_loss(y_test, model.predict_proba(X_test))
-brier = brier_score_loss(y_test, model.predict_proba(X_test)[:, 1])
-auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
-
-# --- Streamlit App ---
-st.title("🏀 NBA Matchup Predictor")
-st.markdown("Predict NBA matchups using team stat differentials and home court edge.")
-
-teams = sorted(team_stats["Team"].unique())
-col1, col2 = st.columns(2)
-with col1:
-    home_team = st.selectbox("🏠 Home Team", teams)
-with col2:
-    away_team = st.selectbox("✈️ Away Team", teams)
-
-if home_team != away_team:
-    try:
-        home_stats = team_stats[team_stats["Team"] == home_team][raw_features].values[0]
-        away_stats = team_stats[team_stats["Team"] == away_team][raw_features].values[0]
-        diff_vector = home_stats - away_stats
-        clipped_vector = np.clip(diff_vector, -1.1, 1.1)
-
-        # Scale only the 5 features (not home indicator)
-        diff_scaled = scaler.transform([clipped_vector])[0]
-
-        # ✅ Manually append exaggerated home advantage
-        final_vector = np.append(diff_scaled, 25)
-
-        probs = model.predict_proba([final_vector])[0]
-        prob_home = probs[1]
-        prob_away = probs[0]
-        predicted_winner = home_team if prob_home > prob_away else away_team
-
-        st.subheader("📈 Prediction")
-        st.success(f"**Predicted Winner: {predicted_winner}**")
-        st.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
-        st.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
-
-    except IndexError:
-        st.error("Team stats not found.")
-else:
-    st.warning("Please select two different teams.")
 
 
 # NHL
