@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score, r2_score, log_loss, brier_score_loss
 import matplotlib.pyplot as plt
 
 # =========================
-# 🏀 NBA Matchup Predictor — No game log (prior-based, tunable)
+# 🏀 NBA Matchup Predictor — clipped, conservative, no tuners
 # =========================
 import glob, re
 import numpy as np
@@ -46,7 +46,6 @@ def _canonize_name(s: str) -> str:
 
 def _auto_rename_nba(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
     norm2orig = {_canonize_name(c): c for c in df.columns}
-
     def pick(*cands):
         for c in cands:
             if c in norm2orig:
@@ -54,10 +53,10 @@ def _auto_rename_nba(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
         return None
 
     team_col   = pick("team","teams","franchise","club","squad")
-    pts_perg   = pick("pts_perg","points_per_game","pts_g","ppg")
-    fg_pct     = pick("fg_pct","field_goal_pct","field_goals_pct","fgp")
+    pts_perg   = pick("pts_perg","points_per_game","pts_g","ppg","pts")
+    fg_pct     = pick("fg_pct","field_goal_pct","field_goals_pct","fgp","fg_percentage")
     threep_pct = pick("threep_pct","three_point_pct","three_point_percentage","3p_pct","3pt_pct")
-    reb_perg   = pick("reb_perg","rebounds_per_game","rebs_perg","rpg","trb_perg","trb_g")
+    reb_perg   = pick("reb_perg","rebounds_per_game","rebs_perg","rpg","trb_perg","trb_g","reb")
 
     rn = {}
     if team_col: rn[team_col] = "Team"
@@ -86,7 +85,6 @@ off, defn = load_frames()
 # ---------- validate ----------
 off_req = {"Team","PTS_perG","FG_pct","ThreeP_pct","REB_perG"}
 def_req = {"Team","PTS_perG_Allowed","FG_pct_Allowed","ThreeP_pct_Allowed","REB_perG_Allowed"}
-
 missing = []
 if not off_req.issubset(off.columns): missing.append(f"Offense CSV missing: {off_req - set(off.columns)}")
 if not def_req.issubset(defn.columns): missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
@@ -122,7 +120,6 @@ def build_edges(h_off, a_off, h_def, a_def):
         "edge_fg":   z_off(h_off,"FG_pct")     - inv_def(a_def,"FG_pct_Allowed"),
         "edge_3p":   z_off(h_off,"ThreeP_pct") - inv_def(a_def,"ThreeP_pct_Allowed"),
         "edge_reb":  z_off(h_off,"REB_perG")   - inv_def(a_def,"REB_perG_Allowed"),
-
         "edge_pts_def":  inv_def(h_def,"PTS_perG_Allowed")    - z_off(a_off,"PTS_perG"),
         "edge_fg_def":   inv_def(h_def,"FG_pct_Allowed")      - z_off(a_off,"FG_pct"),
         "edge_3p_def":   inv_def(h_def,"ThreeP_pct_Allowed")  - z_off(a_off,"ThreeP_pct"),
@@ -133,7 +130,7 @@ def build_edges(h_off, a_off, h_def, a_def):
     x["edge_reb_combo"]    = x["edge_reb"] + x["edge_reb_def"]
     return x
 
-# ---------- clipping ----------
+# ---------- clipping learned from the full grid ----------
 def learn_caps_from_grid(teams, default_cap=0.5, q=0.90):
     rows = []
     for h in teams:
@@ -163,97 +160,83 @@ CAPS = get_caps()
 def clip_feats(d):
     return {k: float(np.clip(v, -CAPS.get(k, 999), CAPS.get(k, 999))) for k, v in d.items()}
 
-# ---------- prior-based scoring (no training) ----------
-DEFAULT_WEIGHTS = {
+# ---------- conservative scoring ----------
+FIXED_WEIGHTS = {
     # offense vs opp D
-    "edge_pts": 0.45,
-    "edge_fg":  0.25,
-    "edge_3p":  0.20,
-    "edge_reb": 0.10,
+    "edge_pts": 0.40,
+    "edge_fg":  0.22,
+    "edge_3p":  0.18,
+    "edge_reb": 0.08,
     # defense vs opp O
-    "edge_pts_def": 0.30,
-    "edge_fg_def":  0.15,
-    "edge_3p_def":  0.15,
-    "edge_reb_def": 0.10,
+    "edge_pts_def": 0.24,
+    "edge_fg_def":  0.12,
+    "edge_3p_def":  0.12,
+    "edge_reb_def": 0.08,
     # composites
-    "edge_shooting_gap": 0.15,
-    "edge_pts_combo":    0.20,
-    "edge_reb_combo":    0.05,
+    "edge_shooting_gap": 0.10,
+    "edge_pts_combo":    0.14,
+    "edge_reb_combo":    0.04,
 }
 
-def logistic(x, k=1.35):  # temperature k controls sharpness
+HOME_EDGE = 0.18       # in edge units
+TEMP_K    = 0.90       # softer sigmoid
+SHRINK_L  = 0.65       # pull toward 0.5
+CLAMP_MIN = 0.10
+CLAMP_MAX = 0.90
+
+def logistic(x, k=TEMP_K):
     return 1.0 / (1.0 + np.exp(-k * x))
 
-def score_from_edges(ed, weights, bias=0.0):
-    # Weighted sum over clipped edges
-    s = bias
+def score_from_edges(ed, weights):
+    s = 0.0
     for f, w in weights.items():
         s += w * ed.get(f, 0.0)
     return float(s)
 
 # ---------- UI ----------
 st.title("NBA Matchup Predictor")
-st.caption("Prior-based model using offense vs defense ‘stat edges’. Tune weights & home-court in the sidebar.")
-
-with st.sidebar:
-    st.header("Model Settings")
-    hca = st.slider("Home-court advantage (edge units)", 0.00, 0.80, 0.20, 0.01)
-    temp = st.slider("Sigmoid temperature (k)", 0.50, 3.00, 1.35, 0.05)
-
-    st.subheader("Weights (click to expand)")
-    with st.expander("Adjust feature weights", expanded=False):
-        w = {}
-        for key in DEFAULT_WEIGHTS:
-            w[key] = st.slider(key, -1.00, 1.50, float(DEFAULT_WEIGHTS[key]), 0.05)
-    st.markdown("---")
-    st.caption("Tip: Increase shooting weights (FG/3P) for pace/spacing eras; increase REB for physical matchups.")
-
 home = st.selectbox("Home Team", teams, index=0)
 away = st.selectbox("Away Team", [t for t in teams if t != home], index=0)
 
 if home and away and home != away:
     h_off, a_off = off_d[home], off_d[away]
     h_def, a_def = def_d[home], def_d[away]
-    raw = build_edges(h_off, a_off, h_def, a_def)
-    x = clip_feats(raw)
 
-    # base edge (home perspective)
-    base_score = score_from_edges(x, w if 'w' in locals() else DEFAULT_WEIGHTS, bias=0.0)
+    # home perspective
+    raw_h = build_edges(h_off, a_off, h_def, a_def)
+    x_h   = clip_feats(raw_h)
+    s_h   = score_from_edges(x_h, FIXED_WEIGHTS)
 
-    # symmetric check: approximate away edge by flipping home/away
-    raw_rev = build_edges(a_off, h_off, a_def, h_def)
-    x_rev = clip_feats(raw_rev)
-    away_base = score_from_edges(x_rev, w if 'w' in locals() else DEFAULT_WEIGHTS, bias=0.0)
+    # away perspective (symmetry)
+    raw_a = build_edges(a_off, h_off, a_def, h_def)
+    x_a   = clip_feats(raw_a)
+    s_a   = score_from_edges(x_a, FIXED_WEIGHTS)
 
-    # ensure antisymmetry by averaging (optional, helps stability)
-    sym_score = 0.5 * (base_score - away_base)
+    # antisymmetric score + fixed home-court
+    sym_score = 0.5 * (s_h - s_a) + HOME_EDGE
 
-    # add home-court advantage
-    sym_score += hca
+    # probability with conservative shaping
+    p_home = float(logistic(sym_score, k=TEMP_K))
+    # shrink toward 0.5 (calibration-by-design)
+    p_home = 0.5 + SHRINK_L * (p_home - 0.5)
+    # final clamp to avoid overconfidence
+    p_home = float(np.clip(p_home, CLAMP_MIN, CLAMP_MAX))
+    p_away = 1.0 - p_home
 
-    prob_home = float(logistic(sym_score, k=temp))
-    prob_away = 1.0 - prob_home
-    winner = home if prob_home >= prob_away else away
+    winner = home if p_home >= p_away else away
 
     st.subheader("Prediction")
     st.success(f"Predicted Winner: {winner}")
     c1, c2 = st.columns(2)
-    c1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
-    c2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
+    c1.metric(f"{home} Win Probability", f"{p_home * 100:.1f}%")
+    c2.metric(f"{away} Win Probability", f"{p_away * 100:.1f}%")
 
     with st.expander("Feature edges (clipped)"):
-        st.dataframe(pd.DataFrame([x]).T.rename(columns={0:"value"}))
+        show = pd.DataFrame([x_h]).T.rename(columns={0:"home_view_edge"})
+        st.dataframe(show)
 
 else:
     st.info("Select two different teams.")
-
-st.markdown(
-    """
-    **Notes**
-    - No game log needed: probabilities come from standardized offense vs defense edges and a tunable sigmoid.
-    - Use the sidebar to calibrate weights or home-court advantage to your era/data source.
-    """
-)
 
 
 
