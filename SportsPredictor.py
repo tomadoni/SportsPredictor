@@ -441,9 +441,9 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — Net edges + home-field bias
+# 🏈 NFL Matchup Predictor — Original edges (fixed sign), conservative clipping
 # =========================
-import os, glob, re, hashlib, json
+import os, glob, re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -585,34 +585,43 @@ def z_off(row, col):  # offense per-game (higher=better)
 def inv_def(row, col_allowed):  # defense allowed (lower=better) -> invert so higher=better
     return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
-# ---------- net-edge features (no mirrored cancellation) ----------
+# ---------- FEATURES (no combo features that cancel) ----------
 FEATURES = [
-    "edge_pts_net","edge_pass_net","edge_rush_net","edge_tot_net",
-    "home_adv_bias"
+    "edge_pts","edge_pass","edge_rush","edge_tot",
+    "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
+    "edge_pass_minus_rush"
 ]
 
-HOME_ADV_BIAS = 0.30  # small bias to push true ties toward home team
+# ---------- build edges (FIXED defensive sign order) ----------
+def build_edges(h_off, a_off, h_def, a_def):
+    # Home offense vs Away defense
+    e_pts  = z_off(h_off,"PTS_perG")      - inv_def(a_def,"PTS_perG_Allowed")
+    e_pass = z_off(h_off,"Pass_YDS_perG") - inv_def(a_def,"Pass_YDS_perG_Allowed")
+    e_rush = z_off(h_off,"Rush_YDS_perG") - inv_def(a_def,"Rush_YDS_perG_Allowed")
+    e_tot  = z_off(h_off,"Tot_YDS_perG")  - inv_def(a_def,"Tot_YDS_perG_Allowed")
 
-def build_edges_net(h_off, a_off, h_def, a_def):
-    # net = (home offense + home defense strength) - (away offense + away defense strength)
-    # offense: higher better; defense allowed: lower better -> use inv_def()
-    e_pts  = ( z_off(h_off,"PTS_perG")       + inv_def(h_def,"PTS_perG_Allowed")
-             - z_off(a_off,"PTS_perG")       - inv_def(a_def,"PTS_perG_Allowed") )
-    e_pass = ( z_off(h_off,"Pass_YDS_perG")  + inv_def(h_def,"Pass_YDS_perG_Allowed")
-             - z_off(a_off,"Pass_YDS_perG")  - inv_def(a_def,"Pass_YDS_perG_Allowed") )
-    e_rush = ( z_off(h_off,"Rush_YDS_perG")  + inv_def(h_def,"Rush_YDS_perG_Allowed")
-             - z_off(a_off,"Rush_YDS_perG")  - inv_def(a_def,"Rush_YDS_perG_Allowed") )
-    e_tot  = ( z_off(h_off,"Tot_YDS_perG")   + inv_def(h_def,"Tot_YDS_perG_Allowed")
-             - z_off(a_off,"Tot_YDS_perG")   - inv_def(a_def,"Tot_YDS_perG_Allowed") )
-    return {
-        "edge_pts_net":  float(e_pts),
-        "edge_pass_net": float(e_pass),
-        "edge_rush_net": float(e_rush),
-        "edge_tot_net":  float(e_tot),
-        "home_adv_bias": float(HOME_ADV_BIAS),
+    # Home defense vs Away offense — IMPORTANT FIX:
+    # Old (problematic): inv_def(h_def) - z_off(a_off)
+    # New (fixed):       z_off(a_off) - inv_def(h_def)
+    e_pts_def  = z_off(a_off,"PTS_perG")      - inv_def(h_def,"PTS_perG_Allowed")
+    e_pass_def = z_off(a_off,"Pass_YDS_perG") - inv_def(h_def,"Pass_YDS_perG_Allowed")
+    e_rush_def = z_off(a_off,"Rush_YDS_perG") - inv_def(h_def,"Rush_YDS_perG_Allowed")
+    e_tot_def  = z_off(a_off,"Tot_YDS_perG")  - inv_def(h_def,"Tot_YDS_perG_Allowed")
+
+    x = {
+        "edge_pts": e_pts,
+        "edge_pass": e_pass,
+        "edge_rush": e_rush,
+        "edge_tot": e_tot,
+        "edge_pts_def": e_pts_def,
+        "edge_pass_def": e_pass_def,
+        "edge_rush_def": e_rush_def,
+        "edge_tot_def": e_tot_def,
     }
+    x["edge_pass_minus_rush"] = x["edge_pass"] - x["edge_rush"]
+    return x
 
-# ---------- feature clipping (90th percentile of |edge|) ----------
+# ---------- clipping ----------
 def learn_caps(df, cols, q=0.90):
     caps = {}
     for c in cols:
@@ -623,39 +632,17 @@ def learn_caps(df, cols, q=0.90):
         if not np.isfinite(cap) or cap < 0.5:
             cap = 0.5
         caps[c] = cap
-    # do not cap the constant bias feature
-    caps["home_adv_bias"] = 999.0
     return caps
 
 def clip_feats(d, caps):
-    out = {}
-    for k, v in d.items():
-        cap = caps.get(k, 999)
-        out[k] = float(np.clip(v, -cap, cap))
-    return out
-
-# ---------- simple data fingerprint to auto-retrain when CSVs change ----------
-def _fingerprint_df(df: pd.DataFrame) -> str:
-    # lightweight, order-invariant-ish text digest
-    sample = df.sort_values(df.columns.tolist()).reset_index(drop=True).round(6).astype(str).head(200).to_json()
-    return hashlib.md5(sample.encode("utf-8")).hexdigest()
-
-DATA_FINGERPRINT = {
-    "off": _fingerprint_df(off[["Team","Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"]]),
-    "def": _fingerprint_df(defn[["Team","Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"]]),
-    "log": _fingerprint_df(glog[["Home Team","Away Team","Home Score","Away Score"]]),
-}
+    return {k: float(np.clip(v, -caps.get(k, 999),  caps.get(k, 999))) for k, v in d.items()}
 
 # ---------- training ----------
 @st.cache_resource(show_spinner=False)
 def train_or_load_model():
     if MODEL_PATH.exists():
-        try:
-            bundle = joblib.load(MODEL_PATH)
-            if bundle.get("fingerprint") == DATA_FINGERPRINT:
-                return bundle["model"], bundle["caps"]
-        except Exception:
-            pass  # fall through to retrain if load fails or schema changed
+        bundle = joblib.load(MODEL_PATH)
+        return bundle["model"], bundle["caps"]
 
     rows = []
     for _, g in glog.iterrows():
@@ -663,7 +650,7 @@ def train_or_load_model():
         if ht not in off_d or at not in off_d or ht not in def_d or at not in def_d:
             continue
         h_off, a_off, h_def, a_def = off_d[ht], off_d[at], def_d[ht], def_d[at]
-        edges = build_edges_net(h_off, a_off, h_def, a_def)  # net edges (home-centric)
+        edges = build_edges(h_off, a_off, h_def, a_def)
         win = 1 if float(g["Home Score"]) > float(g["Away Score"]) else 0
         key = "||".join(sorted([ht, at]))
         rows.append({**edges, "home_win": win, "pair_key": key})
@@ -690,28 +677,30 @@ def train_or_load_model():
 
     # group-aware OOF (sanity only)
     oof = np.zeros(len(y))
-    gkf = GroupKFold(n_splits=min(5, max(2, len(np.unique(groups)))))
+    n_splits = min(5, max(2, len(np.unique(groups))))
+    gkf = GroupKFold(n_splits=n_splits)
     for tr, va in gkf.split(X, y, groups):
-        m = LogisticRegression(C=0.75, max_iter=1000, class_weight="balanced", solver="lbfgs")
+        m = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", solver="lbfgs")
         m.fit(X[tr], y[tr])
         oof[va] = m.predict_proba(X[va])[:, 1]
-    _metrics = {
+
+    _ = {
         "auc": float(roc_auc_score(y, oof)),
         "log_loss": float(log_loss(y, oof, eps=1e-15)),
         "brier": float(brier_score_loss(y, oof)),
         "accuracy@0.5": float(accuracy_score(y, (oof>=0.5).astype(int))),
         "n": int(len(y)),
     }
-    # st.write(_metrics)  # uncomment to view
+    # st.write(_)  # uncomment to inspect
 
-    model = LogisticRegression(C=0.75, max_iter=1000, class_weight="balanced", solver="lbfgs")
+    model = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", solver="lbfgs")
     model.fit(X, y)
 
-    joblib.dump({"model": model, "caps": caps, "fingerprint": DATA_FINGERPRINT}, MODEL_PATH)
+    joblib.dump({"model": model, "caps": caps}, MODEL_PATH)
     return model, caps
 
 # ---------- UI ----------
-st.title("NFL Matchup Predictor (Net Edges + Home Bias)")
+st.title("NFL Matchup Predictor — Original Edges (Fixed Sign)")
 
 clf, caps = train_or_load_model()
 
@@ -724,7 +713,7 @@ if home and away and home != away:
     else:
         h_off, a_off = off_d[home], off_d[away]
         h_def, a_def = def_d[home], def_d[away]
-        raw = build_edges_net(h_off, a_off, h_def, a_def)
+        raw = build_edges(h_off, a_off, h_def, a_def)
         x = clip_feats(raw, caps)
         vec = pd.DataFrame([x])[FEATURES].values
         prob_home = float(clf.predict_proba(vec)[0, 1])
@@ -733,12 +722,11 @@ if home and away and home != away:
 
         st.subheader("Prediction")
         st.success(f"Predicted Winner: {winner}")
-        col1, col2 = st.columns(2)
-        col1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
-        col2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
+        c1, c2 = st.columns(2)
+        c1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
+        c2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
 
-        with st.expander("See features (after clipping)"):
+        with st.expander("Edges (after clipping)"):
             st.dataframe(pd.DataFrame([x]))
 elif home == away:
     st.warning("Please select two different teams.")
-
