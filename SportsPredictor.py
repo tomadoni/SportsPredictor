@@ -441,7 +441,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — Original edges (fixed sign), conservative clipping
+# 🏈 NFL Matchup Predictor — Original edges (fixed sign), robust columns, debug, rule-based fallback
 # =========================
 import os, glob, re
 import numpy as np
@@ -512,7 +512,19 @@ def _auto_rename(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
         if rush_perg: rename_map[rush_perg] = "Rush_YDS_perG"
         if pts_perg:  rename_map[pts_perg]  = "PTS_perG"
 
-    return df.rename(columns=rename_map)
+    out = df.rename(columns=rename_map)
+
+    # force the exact rush-allowed key if casing/typo variants sneak in
+    cols_lower = {c.lower(): c for c in out.columns}
+    for bad in ["rush_yds_perg_allowed", "rush_yds_perg_allowed ", "rush_yds_perg__allowed", "rush_yds_perg_allowed "]:
+        if bad in cols_lower and "Rush_YDS_perG_Allowed" not in out.columns:
+            out = out.rename(columns={cols_lower[bad]: "Rush_YDS_perG_Allowed"})
+    # some sources accidentally use "Rush_YDS_PerG_Allowed" (capital G) — normalize it:
+    for c in list(out.columns):
+        if _canonize_name(c) == "rush_yds_perg_allowed" and c != "Rush_YDS_perG_Allowed":
+            out = out.rename(columns={c: "Rush_YDS_perG_Allowed"})
+
+    return out
 
 off = _auto_rename(off, is_defense=False)
 defn = _auto_rename(defn, is_defense=True)
@@ -565,7 +577,6 @@ NAME_MAP = {
     "Titans": "Tennessee Titans",
     "Vikings": "Minnesota Vikings",
 }
-
 glog["Home Team"] = glog["Home Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
 glog["Away Team"] = glog["Away Team"].map(lambda s: NAME_MAP.get(str(s).strip(), str(s).strip()))
 
@@ -585,43 +596,40 @@ def z_off(row, col):  # offense per-game (higher=better)
 def inv_def(row, col_allowed):  # defense allowed (lower=better) -> invert so higher=better
     return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
-# ---------- FEATURES (no combo features that cancel) ----------
+# ---------- features (original mirrored style, fixed sign, no combos) ----------
 FEATURES = [
     "edge_pts","edge_pass","edge_rush","edge_tot",
     "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
     "edge_pass_minus_rush"
 ]
 
-# ---------- build edges (FIXED defensive sign order) ----------
 def build_edges(h_off, a_off, h_def, a_def):
     # Home offense vs Away defense
-    e_pts  = z_off(h_off,"PTS_perG")      - inv_def(a_def,"PTS_perG_Allowed")
-    e_pass = z_off(h_off,"Pass_YDS_perG") - inv_def(a_def,"Pass_YDS_perG_Allowed")
-    e_rush = z_off(h_off,"Rush_YDS_perG") - inv_def(a_def,"Rush_YDS_perG_Allowed")
-    e_tot  = z_off(h_off,"Tot_YDS_perG")  - inv_def(a_def,"Tot_YDS_perG_Allowed")
+    edge_pts  = z_off(h_off,"PTS_perG")       - inv_def(a_def,"PTS_perG_Allowed")
+    edge_pass = z_off(h_off,"Pass_YDS_perG")  - inv_def(a_def,"Pass_YDS_perG_Allowed")
+    edge_rush = z_off(h_off,"Rush_YDS_perG")  - inv_def(a_def,"Rush_YDS_perG_Allowed")
+    edge_tot  = z_off(h_off,"Tot_YDS_perG")   - inv_def(a_def,"Tot_YDS_perG_Allowed")
 
-    # Home defense vs Away offense — IMPORTANT FIX:
-    # Old (problematic): inv_def(h_def) - z_off(a_off)
-    # New (fixed):       z_off(a_off) - inv_def(h_def)
-    e_pts_def  = z_off(a_off,"PTS_perG")      - inv_def(h_def,"PTS_perG_Allowed")
-    e_pass_def = z_off(a_off,"Pass_YDS_perG") - inv_def(h_def,"Pass_YDS_perG_Allowed")
-    e_rush_def = z_off(a_off,"Rush_YDS_perG") - inv_def(h_def,"Rush_YDS_perG_Allowed")
-    e_tot_def  = z_off(a_off,"Tot_YDS_perG")  - inv_def(h_def,"Tot_YDS_perG_Allowed")
+    # Home defense vs Away offense  (FIXED ORDER → worse home D hurts home)
+    edge_pts_def  = z_off(a_off,"PTS_perG")       - inv_def(h_def,"PTS_perG_Allowed")
+    edge_pass_def = z_off(a_off,"Pass_YDS_perG")  - inv_def(h_def,"Pass_YDS_perG_Allowed")
+    edge_rush_def = z_off(a_off,"Rush_YDS_perG")  - inv_def(h_def,"Rush_YDS_perG_Allowed")
+    edge_tot_def  = z_off(a_off,"Tot_YDS_perG")   - inv_def(h_def,"Tot_YDS_perG_Allowed")
 
     x = {
-        "edge_pts": e_pts,
-        "edge_pass": e_pass,
-        "edge_rush": e_rush,
-        "edge_tot": e_tot,
-        "edge_pts_def": e_pts_def,
-        "edge_pass_def": e_pass_def,
-        "edge_rush_def": e_rush_def,
-        "edge_tot_def": e_tot_def,
+        "edge_pts": edge_pts,
+        "edge_pass": edge_pass,
+        "edge_rush": edge_rush,
+        "edge_tot": edge_tot,
+        "edge_pts_def": edge_pts_def,
+        "edge_pass_def": edge_pass_def,
+        "edge_rush_def": edge_rush_def,
+        "edge_tot_def": edge_tot_def,
     }
     x["edge_pass_minus_rush"] = x["edge_pass"] - x["edge_rush"]
     return x
 
-# ---------- clipping ----------
+# ---------- feature clipping (90th percentile of |edge|) ----------
 def learn_caps(df, cols, q=0.90):
     caps = {}
     for c in cols:
@@ -641,8 +649,11 @@ def clip_feats(d, caps):
 @st.cache_resource(show_spinner=False)
 def train_or_load_model():
     if MODEL_PATH.exists():
-        bundle = joblib.load(MODEL_PATH)
-        return bundle["model"], bundle["caps"]
+        try:
+            bundle = joblib.load(MODEL_PATH)
+            return bundle["model"], bundle["caps"]
+        except Exception:
+            pass  # fall through to retrain if corrupted
 
     rows = []
     for _, g in glog.iterrows():
@@ -675,15 +686,13 @@ def train_or_load_model():
     y = feat["home_win"].values
     groups = feat["pair_key"].values
 
-    # group-aware OOF (sanity only)
+    # group-aware OOF (sanity)
     oof = np.zeros(len(y))
-    n_splits = min(5, max(2, len(np.unique(groups))))
-    gkf = GroupKFold(n_splits=n_splits)
+    gkf = GroupKFold(n_splits=min(5, max(2, len(np.unique(groups)))))
     for tr, va in gkf.split(X, y, groups):
         m = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", solver="lbfgs")
         m.fit(X[tr], y[tr])
         oof[va] = m.predict_proba(X[va])[:, 1]
-
     _ = {
         "auc": float(roc_auc_score(y, oof)),
         "log_loss": float(log_loss(y, oof, eps=1e-15)),
@@ -691,21 +700,38 @@ def train_or_load_model():
         "accuracy@0.5": float(accuracy_score(y, (oof>=0.5).astype(int))),
         "n": int(len(y)),
     }
-    # st.write(_)  # uncomment to inspect
+    # st.write(_)
 
     model = LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", solver="lbfgs")
     model.fit(X, y)
-
     joblib.dump({"model": model, "caps": caps}, MODEL_PATH)
     return model, caps
 
+# ---------- simple rule-based probability (no training) ----------
+def rule_based_prob(h_off, a_off, h_def, a_def, k=0.85):
+    # Net edge: (home offense - away defense) + (home defense - away offense)
+    # Using raw per-game stats (standardized via z's), then logistic to [0,1]
+    edges = build_edges(h_off, a_off, h_def, a_def)
+    # Positive terms help home; negative hurt
+    net = (
+        edges["edge_pts"] + edges["edge_pass"] + edges["edge_rush"] + edges["edge_tot"]
+        - edges["edge_pts_def"] - edges["edge_pass_def"] - edges["edge_rush_def"] - edges["edge_tot_def"]
+    )
+    # scale → probability
+    return 1.0 / (1.0 + np.exp(-k * net))
+
 # ---------- UI ----------
-st.title("NFL Matchup Predictor — Original Edges (Fixed Sign)")
+st.title("NFL Matchup Predictor (Original Edges • Fixed Sign • Debug)")
 
-clf, caps = train_or_load_model()
+use_rule_mode = st.toggle("Rule-Based (no training) mode", value=False)
 
-home = st.selectbox("Home Team", teams)
-away = st.selectbox("Away Team", teams)
+clf, caps = (None, None)
+if not use_rule_mode:
+    clf, caps = train_or_load_model()
+
+teams_list = sorted(set(off["Team"]).intersection(defn["Team"]))
+home = st.selectbox("Home Team", teams_list, index=teams_list.index("Chicago Bears") if "Chicago Bears" in teams_list else 0)
+away = st.selectbox("Away Team", teams_list, index=teams_list.index("New York Giants") if "New York Giants" in teams_list else 1)
 
 if home and away and home != away:
     if home not in off_d or away not in off_d:
@@ -714,9 +740,14 @@ if home and away and home != away:
         h_off, a_off = off_d[home], off_d[away]
         h_def, a_def = def_d[home], def_d[away]
         raw = build_edges(h_off, a_off, h_def, a_def)
-        x = clip_feats(raw, caps)
-        vec = pd.DataFrame([x])[FEATURES].values
-        prob_home = float(clf.predict_proba(vec)[0, 1])
+
+        # clipping for model mode
+        if not use_rule_mode:
+            x = clip_feats(raw, caps)
+            vec = pd.DataFrame([x])[FEATURES].values
+            prob_home = float(clf.predict_proba(vec)[0, 1])
+        else:
+            prob_home = float(rule_based_prob(h_off, a_off, h_def, a_def, k=0.85))
         prob_away = 1.0 - prob_home
         winner = home if prob_home >= prob_away else away
 
@@ -726,7 +757,44 @@ if home and away and home != away:
         c1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
         c2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
 
-        with st.expander("Edges (after clipping)"):
-            st.dataframe(pd.DataFrame([x]))
+        with st.expander("Debug: inputs & features"):
+            # show raw per-game stats used
+            st.markdown("**Raw Offense (Home / Away)**")
+            st.dataframe(pd.DataFrame([h_off[["Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"]],
+                                       a_off[["Tot_YDS_perG","Pass_YDS_perG","Rush_YDS_perG","PTS_perG"]]],
+                                      index=[f"{home} OFF", f"{away} OFF"]))
+
+            st.markdown("**Raw Defense Allowed (Home / Away)**")
+            st.dataframe(pd.DataFrame([h_def[["Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"]],
+                                       a_def[["Tot_YDS_perG_Allowed","Pass_YDS_perG_Allowed","Rush_YDS_perG_Allowed","PTS_perG_Allowed"]]],
+                                      index=[f"{home} DEF", f"{away} DEF"]))
+
+            # z-scores (offense and inverted defense)
+            def zrow_off(r):
+                return pd.Series({
+                    "z_pts": z_off(r,"PTS_perG"),
+                    "z_pass": z_off(r,"Pass_YDS_perG"),
+                    "z_rush": z_off(r,"Rush_YDS_perG"),
+                    "z_tot": z_off(r,"Tot_YDS_perG"),
+                })
+            def zrow_def(r):
+                return pd.Series({
+                    "z_pts_allow(inv)": inv_def(r,"PTS_perG_Allowed"),
+                    "z_pass_allow(inv)": inv_def(r,"Pass_YDS_perG_Allowed"),
+                    "z_rush_allow(inv)": inv_def(r,"Rush_YDS_perG_Allowed"),
+                    "z_tot_allow(inv)": inv_def(r,"Tot_YDS_perG_Allowed"),
+                })
+
+            st.markdown("**Z-scores (higher is better)**")
+            zdf = pd.concat([
+                zrow_off(h_off).rename(f"{home} OFF"),
+                zrow_def(h_def).rename(f"{home} DEF(inv)"),
+                zrow_off(a_off).rename(f"{away} OFF"),
+                zrow_def(a_def).rename(f"{away} DEF(inv)"),
+            ], axis=1).T
+            st.dataframe(zdf)
+
+            st.markdown("**Edges (pre-clip)**")
+            st.dataframe(pd.DataFrame([raw]))
 elif home == away:
     st.warning("Please select two different teams.")
