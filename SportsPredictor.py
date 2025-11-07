@@ -18,7 +18,6 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
-st.set_page_config(page_title="NBA Matchup Predictor", layout="centered")
 
 # ---------- file finder ----------
 def _find_one(possibles):
