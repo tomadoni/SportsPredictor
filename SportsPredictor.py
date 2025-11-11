@@ -441,7 +441,7 @@ if home_team and away_team:
 
 
 # =========================
-# 🏈 NFL Matchup Predictor — Original edges (fixed sign), robust columns, debug, symmetric training
+# 🏈 NFL Matchup Predictor — Anti-symmetric edges, no home bias, debug
 # =========================
 import os, glob, re
 import numpy as np
@@ -596,35 +596,35 @@ def z_off(row, col):  # offense per-game (higher=better)
 def inv_def(row, col_allowed):  # defense allowed (lower=better) -> invert so higher=better
     return -((row[col_allowed] - def_means[col_allowed]) / def_stds[col_allowed])
 
-# ---------- features (original mirrored style, fixed sign, no combos) ----------
+# ---------- ANTI-SYMMETRIC FEATURES ----------
+# These are “home advantage” edges: (home attack vs away D) - (away attack vs home D)
 FEATURES = [
-    "edge_pts","edge_pass","edge_rush","edge_tot",
-    "edge_pts_def","edge_pass_def","edge_rush_def","edge_tot_def",
+    "edge_pts", "edge_pass", "edge_rush", "edge_tot",
     "edge_pass_minus_rush"
 ]
 
 def build_edges(h_off, a_off, h_def, a_def):
-    # Home offense vs Away defense
-    edge_pts  = z_off(h_off,"PTS_perG")       - inv_def(a_def,"PTS_perG_Allowed")
-    edge_pass = z_off(h_off,"Pass_YDS_perG")  - inv_def(a_def,"Pass_YDS_perG_Allowed")
-    edge_rush = z_off(h_off,"Rush_YDS_perG")  - inv_def(a_def,"Rush_YDS_perG_Allowed")
-    edge_tot  = z_off(h_off,"Tot_YDS_perG")   - inv_def(a_def,"Tot_YDS_perG_Allowed")
+    # attack score = offense z - defense_allowed(inverted) z
+    home_pts_att  = z_off(h_off,"PTS_perG")       - inv_def(a_def,"PTS_perG_Allowed")
+    away_pts_att  = z_off(a_off,"PTS_perG")       - inv_def(h_def,"PTS_perG_Allowed")
+    home_pass_att = z_off(h_off,"Pass_YDS_perG")  - inv_def(a_def,"Pass_YDS_perG_Allowed")
+    away_pass_att = z_off(a_off,"Pass_YDS_perG")  - inv_def(h_def,"Pass_YDS_perG_Allowed")
+    home_rush_att = z_off(h_off,"Rush_YDS_perG")  - inv_def(a_def,"Rush_YDS_perG_Allowed")
+    away_rush_att = z_off(a_off,"Rush_YDS_perG")  - inv_def(h_def,"Rush_YDS_perG_Allowed")
+    home_tot_att  = z_off(h_off,"Tot_YDS_perG")   - inv_def(a_def,"Tot_YDS_perG_Allowed")
+    away_tot_att  = z_off(a_off,"Tot_YDS_perG")   - inv_def(h_def,"Tot_YDS_perG_Allowed")
 
-    # Home defense vs Away offense  (worse home D hurts home)
-    edge_pts_def  = z_off(a_off,"PTS_perG")       - inv_def(h_def,"PTS_perG_Allowed")
-    edge_pass_def = z_off(a_off,"Pass_YDS_perG")  - inv_def(h_def,"Pass_YDS_perG_Allowed")
-    edge_rush_def = z_off(a_off,"Rush_YDS_perG")  - inv_def(h_def,"Rush_YDS_perG_Allowed")
-    edge_tot_def  = z_off(a_off,"Tot_YDS_perG")   - inv_def(h_def,"Tot_YDS_perG_Allowed")
+    # anti-symmetric: swap teams → all these flip sign
+    edge_pts  = home_pts_att  - away_pts_att
+    edge_pass = home_pass_att - away_pass_att
+    edge_rush = home_rush_att - away_rush_att
+    edge_tot  = home_tot_att  - away_tot_att
 
     x = {
-        "edge_pts": edge_pts,
+        "edge_pts":  edge_pts,
         "edge_pass": edge_pass,
         "edge_rush": edge_rush,
-        "edge_tot": edge_tot,
-        "edge_pts_def": edge_pts_def,
-        "edge_pass_def": edge_pass_def,
-        "edge_rush_def": edge_rush_def,
-        "edge_tot_def": edge_tot_def,
+        "edge_tot":  edge_tot,
     }
     x["edge_pass_minus_rush"] = x["edge_pass"] - x["edge_rush"]
     return x
@@ -645,7 +645,7 @@ def learn_caps(df, cols, q=0.90):
 def clip_feats(d, caps):
     return {k: float(np.clip(v, -caps.get(k, 999),  caps.get(k, 999))) for k, v in d.items()}
 
-# ---------- training (SYMMETRIC, NO INTERCEPT) ----------
+# ---------- training (ANTI-SYMMETRIC, NO INTERCEPT) ----------
 @st.cache_resource(show_spinner=False)
 def train_or_load_model():
     if MODEL_PATH.exists():
@@ -667,28 +667,19 @@ def train_or_load_model():
         win_home = 1 if home_score > away_score else 0
         key = "||".join(sorted([ht, at]))
 
-        # 1) Row from actual home perspective
-        edges_home = build_edges(h_off, a_off, h_def, a_def)
-        rows.append({**edges_home, "home_win": win_home, "pair_key": key})
-
-        # 2) Symmetric row: swap teams, label flips
-        edges_away = build_edges(a_off, h_off, a_def, h_def)
-        win_away = 1 - win_home
-        rows.append({**edges_away, "home_win": win_away, "pair_key": key})
+        edges = build_edges(h_off, a_off, h_def, a_def)
+        rows.append({**edges, "home_win": win_home, "pair_key": key})
 
     if not rows:
         st.error("No training rows built. Check team names in game log vs Offense/Defense CSVs.")
         st.stop()
 
     feat = pd.DataFrame(rows)
-    # ensure all feature columns exist
     for c in FEATURES:
         if c not in feat.columns:
             feat[c] = 0.0
 
     caps = learn_caps(feat, FEATURES, q=0.90)
-
-    # clip features for training
     for c in FEATURES:
         feat[c] = np.clip(feat[c].values, -caps[c], caps[c])
 
@@ -696,7 +687,7 @@ def train_or_load_model():
     y = feat["home_win"].values
     groups = feat["pair_key"].values
 
-    # group-aware OOF (sanity)
+    # group-aware OOF (sanity only)
     oof = np.zeros(len(y))
     gkf = GroupKFold(n_splits=min(5, max(2, len(np.unique(groups)))))
     for tr, va in gkf.split(X, y, groups):
@@ -705,7 +696,7 @@ def train_or_load_model():
             max_iter=1000,
             class_weight="balanced",
             solver="lbfgs",
-            fit_intercept=False,  # <<< no global home bias
+            fit_intercept=False,  # no global home bias
         )
         m.fit(X[tr], y[tr])
         oof[va] = m.predict_proba(X[va])[:, 1]
@@ -724,7 +715,7 @@ def train_or_load_model():
         max_iter=1000,
         class_weight="balanced",
         solver="lbfgs",
-        fit_intercept=False,  # <<< match CV
+        fit_intercept=False,
     )
     model.fit(X, y)
 
@@ -734,14 +725,16 @@ def train_or_load_model():
 # ---------- simple rule-based probability (no training) ----------
 def rule_based_prob(h_off, a_off, h_def, a_def, k=0.85):
     edges = build_edges(h_off, a_off, h_def, a_def)
+    # simple net: weighted sum of anti-symmetric edges
     net = (
-        edges["edge_pts"] + edges["edge_pass"] + edges["edge_rush"] + edges["edge_tot"]
-        - edges["edge_pts_def"] - edges["edge_pass_def"] - edges["edge_rush_def"] - edges["edge_tot_def"]
+        0.5 * edges["edge_pts"] +
+        0.3 * edges["edge_tot"] +
+        0.2 * edges["edge_pass_minus_rush"]
     )
     return 1.0 / (1.0 + np.exp(-k * net))
 
 # ---------- UI ----------
-st.title("NFL Matchup Predictor (Symmetric, No Home Bias)")
+st.title("NFL Matchup Predictor (Anti-symmetric, No Home Bias)")
 
 use_rule_mode = st.toggle("Rule-Based (no training) mode", value=False)
 
@@ -820,7 +813,7 @@ if home and away and home != away:
             ], axis=1).T
             st.dataframe(zdf)
 
-            st.markdown("**Edges (pre-clip)**")
+            st.markdown("**Edges (anti-symmetric, pre-clip)**")
             st.dataframe(pd.DataFrame([raw]))
 elif home == away:
     st.warning("Please select two different teams.")
