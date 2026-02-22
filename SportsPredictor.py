@@ -725,9 +725,7 @@ def _ncaab_fit_model(df: pd.DataFrame, feature_cols: list, emphasis: dict, ridge
 
 def render_ncaab():
     st.header("🏀 College Basketball Predictor (NCAAB)")
-    st.caption(
-        "Emphasis on conference strength (# March Madness teams), DRtg, ORtg, Pythagorean wins, and 3PPG."
-    )
+    st.caption("Team-based model using conference strength, ORtg/DRtg, Pythagorean wins, and 3PPG emphasis.")
 
     CSV_PATH = "ncaab.csv"
     TEAM_COL = "team"
@@ -747,7 +745,8 @@ def render_ncaab():
         "ast",
     ]
 
-    DEFAULT_EMPHASIS = {
+    # Emphasis baked in (like your other sports weights)
+    EMPHASIS = {
         "conference strength": 1.60,
         "drtg": 1.55,
         "ortg": 1.55,
@@ -755,31 +754,77 @@ def render_ncaab():
         "3ppg": 1.35,
     }
 
-    HOME_ADV_LOGIT = 0.12
+    RIDGE_ALPHA = 2.0
+    HOME_ADV_LOGIT = 0.12  # small bump like your other sports
+    CLAMP_MIN, CLAMP_MAX = 0.10, 0.90  # conservative like your NBA
 
-    with st.sidebar.expander("NCAAB Model Settings", expanded=False):
-        ridge_alpha = st.slider("Ridge alpha", 0.1, 20.0, 2.0, 0.1, key="ncaab_ridge_alpha")
-        emphasis = {}
-        st.write("Feature emphasis (multiplier):")
-        for k, v in DEFAULT_EMPHASIS.items():
-            emphasis[k] = st.slider(k, 0.8, 2.5, float(v), 0.05, key=f"ncaab_emph_{k}")
+    # ---- load ----
     try:
         df = _ncaab_load_data(CSV_PATH, TEAM_COL, RECORD_COL, FEATURE_COLS)
     except Exception as e:
         st.error(f"NCAAB: Could not load data ({CSV_PATH}): {e}")
         return
 
-    model = _ncaab_fit_model(df, FEATURE_COLS, emphasis, ridge_alpha)
+    # ---- fit model ----
+    model = _ncaab_fit_model(df, FEATURE_COLS, EMPHASIS, RIDGE_ALPHA)
 
     teams = sorted(df[TEAM_COL].astype(str).unique().tolist())
 
-    top = st.columns([2, 2, 1])
-    with top[0]:
-        teamA_name = st.selectbox("Team A", teams, index=0, key="ncaab_teamA")
-    with top[1]:
-        teamB_name = st.selectbox("Team B", teams, index=1 if len(teams) > 1 else 0, key="ncaab_teamB")
-    with top[2]:
-        home_team = st.selectbox("Home", ["Neutral", "Team A", "Team B"], index=0, key="ncaab_home")
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        home_team = st.selectbox("Home Team (NCAAB)", teams, index=0, key="ncaab_home_team")
+    with col2:
+        away_team = st.selectbox(
+            "Away Team (NCAAB)",
+            [t for t in teams if t != home_team],
+            index=0,
+            key="ncaab_away_team",
+        )
+    with col3:
+        site = st.selectbox("Site", ["Home", "Neutral"], index=0, key="ncaab_site")
+
+    if not home_team or not away_team or home_team == away_team:
+        st.info("Select two different teams.")
+        return
+
+    # pull team rows from CSV (no manual inputs)
+    hrow = df.loc[df[TEAM_COL].astype(str).str.lower().eq(home_team.lower())].iloc[0]
+    arow = df.loc[df[TEAM_COL].astype(str).str.lower().eq(away_team.lower())].iloc[0]
+
+    home_stats = {c: float(hrow[c]) for c in FEATURE_COLS}
+    away_stats = {c: float(arow[c]) for c in FEATURE_COLS}
+
+    # predict “team quality” (win% proxy) then convert to matchup prob like your other sports
+    pH = _ncaab_predict_team_win_pct(model, FEATURE_COLS, home_stats, EMPHASIS)
+    pA = _ncaab_predict_team_win_pct(model, FEATURE_COLS, away_stats, EMPHASIS)
+
+    sH = _ncaab_logit(pH)
+    sA = _ncaab_logit(pA)
+
+    adv = HOME_ADV_LOGIT if site == "Home" else 0.0
+    prob_home = _ncaab_sigmoid((sH - sA) + adv)
+
+    # conservative shaping like your NBA
+    prob_home = float(np.clip(prob_home, CLAMP_MIN, CLAMP_MAX))
+    prob_away = 1.0 - prob_home
+    winner = home_team if prob_home >= prob_away else away_team
+
+    st.subheader("Prediction")
+    st.success(f"Predicted Winner: {winner}")
+    c1, c2 = st.columns(2)
+    c1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
+    c2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
+
+    with st.expander("Debug: key stats used"):
+        show_cols = ["conference strength", "ortg", "drtg", "pythagorean wins", "3ppg"]
+        dbg = pd.DataFrame(
+            {
+                "Stat": show_cols,
+                home_team: [home_stats[c] for c in show_cols],
+                away_team: [away_stats[c] for c in show_cols],
+            }
+        )
+        st.dataframe(dbg, use_container_width=True)
 
     def stats_editor(team_name: str, prefix: str) -> dict:
         row = df.loc[df[TEAM_COL].astype(str).str.lower().eq(str(team_name).lower())]
