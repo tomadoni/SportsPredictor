@@ -755,7 +755,7 @@ def render_ncaab():
     ]
 
     EMPHASIS = {
-        "conference strength": 1.60,
+        "conference strength": 3.60,
         "drtg": 1.55,
         "ortg": 1.55,
         "pythagorean wins": 1.45,
