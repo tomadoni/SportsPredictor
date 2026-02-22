@@ -666,6 +666,8 @@ def render_nfl():
         st.warning("Please select two different teams.")
 
 
+
+
 # =========================================================
 # NCAAB (your requested emphasis-based team model -> matchup prob)
 # =========================================================
@@ -724,8 +726,15 @@ def _ncaab_fit_model(df: pd.DataFrame, feature_cols: list, emphasis: dict, ridge
 
 
 def render_ncaab():
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import Ridge
+
     st.header("🏀 College Basketball Predictor (NCAAB)")
-    st.caption("Team-based model using conference strength, ORtg/DRtg, Pythagorean wins, and 3PPG emphasis.")
+    st.caption("Pick teams → get probabilities. Emphasis on conference strength, DRtg, ORtg, Pyth wins, and 3PPG.")
 
     CSV_PATH = "ncaab.csv"
     TEAM_COL = "team"
@@ -755,67 +764,128 @@ def render_ncaab():
     }
 
     RIDGE_ALPHA = 2.0
-    HOME_ADV_LOGIT = 0.12  # small bump like your other sports
-    CLAMP_MIN, CLAMP_MAX = 0.10, 0.90  # conservative like your NBA
+    HOME_ADV_LOGIT = 0.12      # small bump when "Home"
+    CLAMP_MIN, CLAMP_MAX = 0.10, 0.90  # conservative
 
-    # ---- load ----
+    def parse_record_to_win_pct(record: str) -> float:
+        w, l = str(record).split("-")
+        w, l = int(w), int(l)
+        g = max(w + l, 1)
+        return w / g
+
+    def apply_emphasis(X: pd.DataFrame) -> pd.DataFrame:
+        X2 = X.copy()
+        for col, factor in EMPHASIS.items():
+            if col in X2.columns:
+                X2[col] = X2[col].astype(float) * float(factor)
+        return X2
+
+    def clip01(p: float, eps: float = 1e-6) -> float:
+        return float(np.clip(p, eps, 1 - eps))
+
+    def logit(p: float) -> float:
+        p = clip01(p)
+        return float(np.log(p / (1 - p)))
+
+    def sigmoid(z: float) -> float:
+        return float(1.0 / (1.0 + np.exp(-z)))
+
+    @st.cache_data(show_spinner=False)
+    def load_df():
+        df = pd.read_csv(CSV_PATH)
+        df.columns = [c.strip() for c in df.columns]
+
+        if TEAM_COL not in df.columns:
+            raise ValueError(f"Missing '{TEAM_COL}' column.")
+        if RECORD_COL not in df.columns:
+            raise ValueError(f"Missing '{RECORD_COL}' column (like '22-5').")
+
+        df["win_pct"] = df[RECORD_COL].astype(str).apply(parse_record_to_win_pct)
+
+        for c in FEATURE_COLS:
+            if c not in df.columns:
+                raise ValueError(f"Missing feature column: {c}")
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        df = df.dropna(subset=FEATURE_COLS + ["win_pct"]).reset_index(drop=True)
+        return df
+
+    @st.cache_resource(show_spinner=False)
+    def fit_model(df: pd.DataFrame):
+        X = df[FEATURE_COLS].copy()
+        y = df["win_pct"].astype(float).values
+
+        X = apply_emphasis(X)
+
+        pipe = Pipeline(
+            steps=[
+                ("scaler", StandardScaler()),
+                ("ridge", Ridge(alpha=float(RIDGE_ALPHA), random_state=42)),
+            ]
+        )
+        pipe.fit(X, y)
+        return pipe
+
     try:
-        df = _ncaab_load_data(CSV_PATH, TEAM_COL, RECORD_COL, FEATURE_COLS)
+        df = load_df()
     except Exception as e:
-        st.error(f"NCAAB: Could not load data ({CSV_PATH}): {e}")
+        st.error(f"NCAAB: Could not load {CSV_PATH}: {e}")
         return
 
-    # ---- fit model ----
-    model = _ncaab_fit_model(df, FEATURE_COLS, EMPHASIS, RIDGE_ALPHA)
+    model = fit_model(df)
 
     teams = sorted(df[TEAM_COL].astype(str).unique().tolist())
 
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        home_team = st.selectbox("Home Team (NCAAB)", teams, index=0, key="ncaab_home_team")
-    with col2:
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        home_team = st.selectbox("Home Team", teams, index=0, key="ncaab_home_team")
+    with c2:
         away_team = st.selectbox(
-            "Away Team (NCAAB)",
+            "Away Team",
             [t for t in teams if t != home_team],
             index=0,
             key="ncaab_away_team",
         )
-    with col3:
+    with c3:
         site = st.selectbox("Site", ["Home", "Neutral"], index=0, key="ncaab_site")
 
     if not home_team or not away_team or home_team == away_team:
         st.info("Select two different teams.")
         return
 
-    # pull team rows from CSV (no manual inputs)
+    # Pull team feature rows from CSV
     hrow = df.loc[df[TEAM_COL].astype(str).str.lower().eq(home_team.lower())].iloc[0]
     arow = df.loc[df[TEAM_COL].astype(str).str.lower().eq(away_team.lower())].iloc[0]
 
     home_stats = {c: float(hrow[c]) for c in FEATURE_COLS}
     away_stats = {c: float(arow[c]) for c in FEATURE_COLS}
 
-    # predict “team quality” (win% proxy) then convert to matchup prob like your other sports
-    pH = _ncaab_predict_team_win_pct(model, FEATURE_COLS, home_stats, EMPHASIS)
-    pA = _ncaab_predict_team_win_pct(model, FEATURE_COLS, away_stats, EMPHASIS)
+    # Predict team "quality" (win_pct proxy)
+    Xh = apply_emphasis(pd.DataFrame([home_stats], columns=FEATURE_COLS))
+    Xa = apply_emphasis(pd.DataFrame([away_stats], columns=FEATURE_COLS))
 
-    sH = _ncaab_logit(pH)
-    sA = _ncaab_logit(pA)
+    pH = float(model.predict(Xh)[0])
+    pA = float(model.predict(Xa)[0])
 
+    pH = float(np.clip(pH, 0.05, 0.95))
+    pA = float(np.clip(pA, 0.05, 0.95))
+
+    # Convert to matchup probability via logit difference (clean + symmetric)
     adv = HOME_ADV_LOGIT if site == "Home" else 0.0
-    prob_home = _ncaab_sigmoid((sH - sA) + adv)
+    prob_home = sigmoid((logit(pH) - logit(pA)) + adv)
 
-    # conservative shaping like your NBA
+    # Conservative clamp like your NBA
     prob_home = float(np.clip(prob_home, CLAMP_MIN, CLAMP_MAX))
     prob_away = 1.0 - prob_home
     winner = home_team if prob_home >= prob_away else away_team
 
     st.subheader("Prediction")
     st.success(f"Predicted Winner: {winner}")
-    c1, c2 = st.columns(2)
-    c1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
-    c2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
+    m1, m2 = st.columns(2)
+    m1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
+    m2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
-    with st.expander("Debug: key stats used"):
+    with st.expander("Debug: emphasized stats"):
         show_cols = ["conference strength", "ortg", "drtg", "pythagorean wins", "3ppg"]
         dbg = pd.DataFrame(
             {
