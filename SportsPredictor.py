@@ -761,7 +761,7 @@ def render_ncaab():
         "drtg_inv": 1.55,
         "ortg": 1.55,
         "pythagorean wins": 1.45,
-        "3ppg": 1.35,
+        "3ppg": 1.15,
     }
 
     RIDGE_ALPHA = 2.0
