@@ -757,7 +757,7 @@ def render_ncaab():
 
     # ✅ bigger conference weight
     EMPHASIS = {
-        "conference strength": 1.95,
+        "conference strength": 1.55,
         "drtg_inv": 1.55,
         "ortg": 1.55,
         "pythagorean wins": 1.45,
