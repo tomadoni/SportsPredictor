@@ -685,3 +685,320 @@ if home and away and home != away:
 elif home == away:
     st.warning("Please select two different teams.")
 
+
+
+# streamlit_ncaab_predictor.py
+# Streamlit-ready NCAAB matchup predictor (fits model from ncaab.csv, then predicts A vs B)
+# Run: streamlit run streamlit_ncaab_predictor.py
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+
+
+# =========================
+# Data + Model Config
+# =========================
+CSV_PATH = "/mnt/data/ncaab.csv"  # <-- your uploaded file path
+
+FEATURE_COLS = [
+    "conference strength",  # # of March Madness teams from the conference
+    "ortg",
+    "drtg",
+    "pythagorean wins",
+    "3ppg",
+    "ppg",
+    "fg%",
+    "3p%",
+    "ft%",
+    "reb",
+    "ast",
+]
+
+TEAM_COL = "team"
+RECORD_COL = "record"
+
+DEFAULT_EMPHASIS = {
+    "conference strength": 1.60,
+    "drtg": 1.55,
+    "ortg": 1.55,
+    "pythagorean wins": 1.45,
+    "3ppg": 1.35,
+}
+
+DEFAULT_HOME_ADV_LOGIT = 0.12  # tweak if you want more/less home edge
+
+
+# =========================
+# Helper functions
+# =========================
+def parse_record_to_win_pct(record: str) -> float:
+    # expects "22-5"
+    w, l = record.split("-")
+    w, l = int(w), int(l)
+    games = max(w + l, 1)
+    return w / games
+
+
+def clip01(x: float, eps: float = 1e-6) -> float:
+    return float(np.clip(x, eps, 1 - eps))
+
+
+def logit(p: float) -> float:
+    p = clip01(p)
+    return float(np.log(p / (1 - p)))
+
+
+def sigmoid(z: float) -> float:
+    return float(1 / (1 + np.exp(-z)))
+
+
+def apply_emphasis(X: pd.DataFrame, emphasis: dict) -> pd.DataFrame:
+    X2 = X.copy()
+    for col, factor in emphasis.items():
+        if col in X2.columns:
+            X2[col] = X2[col].astype(float) * float(factor)
+    return X2
+
+
+@st.cache_data(show_spinner=False)
+def load_data(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip() for c in df.columns]
+
+    if TEAM_COL not in df.columns:
+        raise ValueError(f"Expected '{TEAM_COL}' column in CSV.")
+    if RECORD_COL not in df.columns:
+        raise ValueError(f"Expected '{RECORD_COL}' column like '22-5' in CSV.")
+
+    # target: win%
+    df["win_pct"] = df[RECORD_COL].astype(str).apply(parse_record_to_win_pct)
+
+    # ensure numeric
+    for c in FEATURE_COLS:
+        if c not in df.columns:
+            raise ValueError(f"Missing expected feature column: {c}")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=FEATURE_COLS + ["win_pct"]).reset_index(drop=True)
+    return df
+
+
+@st.cache_resource(show_spinner=False)
+def fit_model(df: pd.DataFrame, emphasis: dict, ridge_alpha: float) -> Pipeline:
+    X = df[FEATURE_COLS].copy()
+    y = df["win_pct"].astype(float).values
+
+    X = apply_emphasis(X, emphasis)
+
+    pipe = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("ridge", Ridge(alpha=float(ridge_alpha), random_state=42)),
+        ]
+    )
+    pipe.fit(X, y)
+    return pipe
+
+
+def predict_team_win_pct(model: Pipeline, team_stats: dict, emphasis: dict) -> float:
+    X = pd.DataFrame([team_stats], columns=FEATURE_COLS)
+    X = apply_emphasis(X, emphasis)
+    pred = float(model.predict(X)[0])
+    return float(np.clip(pred, 0.05, 0.95))
+
+
+def predict_matchup(model: Pipeline, teamA_stats: dict, teamB_stats: dict, emphasis: dict, home_team: str) -> dict:
+    pA = predict_team_win_pct(model, teamA_stats, emphasis)
+    pB = predict_team_win_pct(model, teamB_stats, emphasis)
+
+    sA = logit(pA)
+    sB = logit(pB)
+
+    adv = 0.0
+    if home_team == "Team A":
+        adv = DEFAULT_HOME_ADV_LOGIT
+    elif home_team == "Team B":
+        adv = -DEFAULT_HOME_ADV_LOGIT
+
+    probA = sigmoid((sA - sB) + adv)
+    return {
+        "teamA_win_prob": probA,
+        "teamB_win_prob": 1.0 - probA,
+        "teamA_model_win_pct": pA,
+        "teamB_model_win_pct": pB,
+        "teamA_strength_logit": sA,
+        "teamB_strength_logit": sB,
+        "home_adv_logit_used": adv,
+    }
+
+
+def get_team_row(df: pd.DataFrame, team_name: str) -> pd.Series:
+    row = df.loc[df[TEAM_COL].astype(str).str.lower().eq(str(team_name).lower())]
+    if row.empty:
+        raise ValueError(f"Team not found: {team_name}")
+    return row.iloc[0]
+
+
+def stats_editor(df: pd.DataFrame, team_name: str, prefix: str) -> dict:
+    row = get_team_row(df, team_name)
+
+    st.markdown(f"**{prefix} stats inputs** (edit anything you want)")
+
+    cols = st.columns(3)
+
+    # Put your “emphasis” stats in the first spots so they’re most visible
+    key_order = [
+        "conference strength",
+        "ortg",
+        "drtg",
+        "pythagorean wins",
+        "3ppg",
+        "ppg",
+        "fg%",
+        "3p%",
+        "ft%",
+        "reb",
+        "ast",
+    ]
+
+    out = {}
+    for i, k in enumerate(key_order):
+        with cols[i % 3]:
+            default_val = float(row[k])
+            # Conference strength is an integer conceptually
+            if k == "conference strength":
+                out[k] = float(
+                    st.number_input(
+                        f"{prefix} {k}",
+                        value=int(round(default_val)),
+                        min_value=0,
+                        max_value=20,
+                        step=1,
+                        key=f"{prefix}_{k}",
+                        help="Number of teams from this conference in March Madness (use your own estimate).",
+                    )
+                )
+            else:
+                out[k] = float(
+                    st.number_input(
+                        f"{prefix} {k}",
+                        value=default_val,
+                        step=0.1,
+                        key=f"{prefix}_{k}",
+                    )
+                )
+    return out
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="NCAAB Predictor", layout="wide")
+
+st.title("🏀 College Basketball Matchup Predictor (NCAAB)")
+st.caption(
+    "Trains a simple model from your `ncaab.csv` team stats, then predicts Team A vs Team B. "
+    "You can edit inputs — especially conference strength (# tourney teams), ORtg, DRtg, Pythagorean wins, and 3PPG."
+)
+
+# Sidebar: model knobs
+st.sidebar.header("Model settings")
+
+ridge_alpha = st.sidebar.slider("Ridge alpha (stability)", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
+
+st.sidebar.subheader("Feature emphasis (multiplier)")
+emphasis = {}
+for k, v in DEFAULT_EMPHASIS.items():
+    emphasis[k] = st.sidebar.slider(k, min_value=0.8, max_value=2.5, value=float(v), step=0.05)
+
+st.sidebar.caption("Higher multipliers = those features influence the model more.")
+
+# Load data
+try:
+    df = load_data(CSV_PATH)
+except Exception as e:
+    st.error(f"Could not load data: {e}")
+    st.stop()
+
+# Fit model
+model = fit_model(df, emphasis, ridge_alpha)
+
+# Team selectors
+teams = sorted(df[TEAM_COL].astype(str).unique().tolist())
+
+top = st.columns([2, 2, 1, 1])
+with top[0]:
+    teamA_name = st.selectbox("Team A", teams, index=0)
+with top[1]:
+    default_idx = 1 if len(teams) > 1 else 0
+    teamB_name = st.selectbox("Team B", teams, index=default_idx)
+with top[2]:
+    home_team = st.selectbox("Home court", ["Neutral", "Team A", "Team B"], index=0)
+with top[3]:
+    show_details = st.checkbox("Show model details", value=False)
+
+# Input editors (pull defaults from CSV but editable)
+left, right = st.columns(2)
+with left:
+    teamA_stats = stats_editor(df, teamA_name, "Team A")
+with right:
+    teamB_stats = stats_editor(df, teamB_name, "Team B")
+
+# Predict
+if st.button("Predict matchup", type="primary", use_container_width=True):
+    if teamA_name == teamB_name:
+        st.warning("Pick two different teams.")
+    else:
+        out = predict_matchup(model, teamA_stats, teamB_stats, emphasis, home_team)
+
+        probA = out["teamA_win_prob"]
+        probB = out["teamB_win_prob"]
+
+        st.subheader("Prediction")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.metric(f"{teamA_name} win probability", f"{probA*100:.1f}%")
+        with c2:
+            st.metric(f"{teamB_name} win probability", f"{probB*100:.1f}%")
+        with c3:
+            # simple “edge” indicator
+            edge = (probA - 0.5) * 100
+            st.metric("Edge (Team A vs 50/50)", f"{edge:+.1f}%")
+
+        if show_details:
+            st.divider()
+            st.markdown("**Model details**")
+            st.write(
+                {
+                    "Team A model win%": round(out["teamA_model_win_pct"], 4),
+                    "Team B model win%": round(out["teamB_model_win_pct"], 4),
+                    "Team A strength (logit)": round(out["teamA_strength_logit"], 4),
+                    "Team B strength (logit)": round(out["teamB_strength_logit"], 4),
+                    "Home adv logit used": round(out["home_adv_logit_used"], 4),
+                    "Emphasis multipliers": emphasis,
+                    "Ridge alpha": ridge_alpha,
+                }
+            )
+
+        st.divider()
+        st.markdown("**Current inputs used**")
+        preview = pd.DataFrame(
+            {
+                "Feature": FEATURE_COLS,
+                f"{teamA_name} (A)": [teamA_stats[c] for c in FEATURE_COLS],
+                f"{teamB_name} (B)": [teamB_stats[c] for c in FEATURE_COLS],
+            }
+        )
+        st.dataframe(preview, use_container_width=True)
+
+# Small footer info
+st.caption(
+    "Note: conference strength is treated as your input = number of March Madness teams from that conference. "
+    "If you want this to auto-update by season, tell me what source you’re using and I’ll wire it in."
+)
