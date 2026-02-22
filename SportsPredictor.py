@@ -740,7 +740,7 @@ def render_ncaab():
     TEAM_COL = "team"
     RECORD_COL = "record"
 
-    # ✅ DRtg is inverted so higher = better
+    # DRtg inverted so higher = better
     FEATURE_COLS = [
         "conference strength",
         "ortg",
@@ -755,9 +755,9 @@ def render_ncaab():
         "ast",
     ]
 
-    # ✅ bigger conference weight
+    # Emphasis multipliers (conference strength boosted but not crazy)
     EMPHASIS = {
-        "conference strength": 1.05,
+        "conference strength": 2.0,
         "drtg_inv": 1.55,
         "ortg": 1.55,
         "pythagorean wins": 1.45,
@@ -768,9 +768,9 @@ def render_ncaab():
     HOME_ADV_LOGIT = 0.12
     CLAMP_MIN, CLAMP_MAX = 0.10, 0.90
 
-    # ✅ optional: guaranteed-direction conference bump on final probability
-    # Try 0.10–0.30. Higher = more conference-driven.
-    CONF_LOGIT_BONUS = 0.18
+    # Direct conference adjustment (guaranteed direction) + capped delta
+    CONF_LOGIT_BONUS = 0.16
+    CONF_DELTA_CAP = 8.0
 
     def parse_record_to_win_pct(record: str) -> float:
         w, l = str(record).split("-")
@@ -804,17 +804,19 @@ def render_ncaab():
 
         df["win_pct"] = df[RECORD_COL].astype(str).apply(parse_record_to_win_pct)
 
-        # make sure base columns are numeric
-        needed_raw = ["conference strength", "ortg", "drtg", "pythagorean wins", "3ppg", "ppg", "fg%", "3p%", "ft%", "reb", "ast"]
+        # Ensure base columns are numeric
+        needed_raw = [
+            "conference strength", "ortg", "drtg", "pythagorean wins", "3ppg",
+            "ppg", "fg%", "3p%", "ft%", "reb", "ast"
+        ]
         for c in needed_raw:
             if c not in df.columns:
                 raise ValueError(f"Missing feature column: {c}")
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # ✅ invert DRtg (lower=better -> higher=better)
+        # Invert DRtg (lower=better -> higher=better)
         df["drtg_inv"] = -df["drtg"]
 
-        # now require final features
         df = df.dropna(subset=FEATURE_COLS + ["win_pct"]).reset_index(drop=True)
         return df
 
@@ -826,7 +828,7 @@ def render_ncaab():
         pipe = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
-                # ✅ positive=True prevents "conference strength" from flipping negative
+                # positive=True keeps features from learning negative direction
                 ("ridge", Ridge(alpha=float(RIDGE_ALPHA), random_state=42, positive=True)),
             ]
         )
@@ -846,7 +848,12 @@ def render_ncaab():
     with col1:
         home_team = st.selectbox("Home Team", teams, index=0, key="ncaab_home_team")
     with col2:
-        away_team = st.selectbox("Away Team", [t for t in teams if t != home_team], index=0, key="ncaab_away_team")
+        away_team = st.selectbox(
+            "Away Team",
+            [t for t in teams if t != home_team],
+            index=0,
+            key="ncaab_away_team",
+        )
     with col3:
         site = st.selectbox("Site", ["Home", "Neutral"], index=0, key="ncaab_site")
 
@@ -868,8 +875,9 @@ def render_ncaab():
 
     adv = HOME_ADV_LOGIT if site == "Home" else 0.0
 
-    # ✅ guaranteed-direction conference adjustment (home conf - away conf)
+    # Conference adjustment (home conf - away conf), capped to avoid insane swings
     conf_delta = home_stats["conference strength"] - away_stats["conference strength"]
+    conf_delta = float(np.clip(conf_delta, -CONF_DELTA_CAP, CONF_DELTA_CAP))
     conf_adj = CONF_LOGIT_BONUS * conf_delta
 
     prob_home = sigmoid((logit(pH) - logit(pA)) + adv + conf_adj)
@@ -887,7 +895,6 @@ def render_ncaab():
     with st.expander("Debug (optional)"):
         st.write("Conference delta (home - away):", conf_delta)
         st.write("Conference logit adj:", conf_adj)
-
 
 # =========================================================
 # Main App UI (clean selector)
