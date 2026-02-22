@@ -754,7 +754,6 @@ def render_ncaab():
         "ast",
     ]
 
-    # Emphasis baked in (like your other sports weights)
     EMPHASIS = {
         "conference strength": 1.60,
         "drtg": 1.55,
@@ -764,8 +763,8 @@ def render_ncaab():
     }
 
     RIDGE_ALPHA = 2.0
-    HOME_ADV_LOGIT = 0.12      # small bump when "Home"
-    CLAMP_MIN, CLAMP_MAX = 0.10, 0.90  # conservative
+    HOME_ADV_LOGIT = 0.12
+    CLAMP_MIN, CLAMP_MAX = 0.10, 0.90
 
     def parse_record_to_win_pct(record: str) -> float:
         w, l = str(record).split("-")
@@ -780,11 +779,8 @@ def render_ncaab():
                 X2[col] = X2[col].astype(float) * float(factor)
         return X2
 
-    def clip01(p: float, eps: float = 1e-6) -> float:
-        return float(np.clip(p, eps, 1 - eps))
-
     def logit(p: float) -> float:
-        p = clip01(p)
+        p = float(np.clip(p, 1e-6, 1 - 1e-6))
         return float(np.log(p / (1 - p)))
 
     def sigmoid(z: float) -> float:
@@ -812,10 +808,8 @@ def render_ncaab():
 
     @st.cache_resource(show_spinner=False)
     def fit_model(df: pd.DataFrame):
-        X = df[FEATURE_COLS].copy()
+        X = apply_emphasis(df[FEATURE_COLS].copy())
         y = df["win_pct"].astype(float).values
-
-        X = apply_emphasis(X)
 
         pipe = Pipeline(
             steps=[
@@ -833,160 +827,44 @@ def render_ncaab():
         return
 
     model = fit_model(df)
-
     teams = sorted(df[TEAM_COL].astype(str).unique().tolist())
 
-    c1, c2, c3 = st.columns([2, 2, 1])
-    with c1:
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
         home_team = st.selectbox("Home Team", teams, index=0, key="ncaab_home_team")
-    with c2:
-        away_team = st.selectbox(
-            "Away Team",
-            [t for t in teams if t != home_team],
-            index=0,
-            key="ncaab_away_team",
-        )
-    with c3:
+    with col2:
+        away_team = st.selectbox("Away Team", [t for t in teams if t != home_team], index=0, key="ncaab_away_team")
+    with col3:
         site = st.selectbox("Site", ["Home", "Neutral"], index=0, key="ncaab_site")
 
-    if not home_team or not away_team or home_team == away_team:
-        st.info("Select two different teams.")
+    if home_team == away_team:
+        st.warning("Pick two different teams.")
         return
 
-    # Pull team feature rows from CSV
     hrow = df.loc[df[TEAM_COL].astype(str).str.lower().eq(home_team.lower())].iloc[0]
     arow = df.loc[df[TEAM_COL].astype(str).str.lower().eq(away_team.lower())].iloc[0]
 
     home_stats = {c: float(hrow[c]) for c in FEATURE_COLS}
     away_stats = {c: float(arow[c]) for c in FEATURE_COLS}
 
-    # Predict team "quality" (win_pct proxy)
-    Xh = apply_emphasis(pd.DataFrame([home_stats], columns=FEATURE_COLS))
-    Xa = apply_emphasis(pd.DataFrame([away_stats], columns=FEATURE_COLS))
-
-    pH = float(model.predict(Xh)[0])
-    pA = float(model.predict(Xa)[0])
+    pH = float(model.predict(apply_emphasis(pd.DataFrame([home_stats], columns=FEATURE_COLS)))[0])
+    pA = float(model.predict(apply_emphasis(pd.DataFrame([away_stats], columns=FEATURE_COLS)))[0])
 
     pH = float(np.clip(pH, 0.05, 0.95))
     pA = float(np.clip(pA, 0.05, 0.95))
 
-    # Convert to matchup probability via logit difference (clean + symmetric)
     adv = HOME_ADV_LOGIT if site == "Home" else 0.0
     prob_home = sigmoid((logit(pH) - logit(pA)) + adv)
 
-    # Conservative clamp like your NBA
     prob_home = float(np.clip(prob_home, CLAMP_MIN, CLAMP_MAX))
     prob_away = 1.0 - prob_home
     winner = home_team if prob_home >= prob_away else away_team
 
     st.subheader("Prediction")
     st.success(f"Predicted Winner: {winner}")
-    m1, m2 = st.columns(2)
-    m1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
-    m2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
-
-    with st.expander("Debug: emphasized stats"):
-        show_cols = ["conference strength", "ortg", "drtg", "pythagorean wins", "3ppg"]
-        dbg = pd.DataFrame(
-            {
-                "Stat": show_cols,
-                home_team: [home_stats[c] for c in show_cols],
-                away_team: [away_stats[c] for c in show_cols],
-            }
-        )
-        st.dataframe(dbg, use_container_width=True)
-
-    def stats_editor(team_name: str, prefix: str) -> dict:
-        row = df.loc[df[TEAM_COL].astype(str).str.lower().eq(str(team_name).lower())]
-        if row.empty:
-            raise ValueError(f"Team not found: {team_name}")
-        row = row.iloc[0]
-
-        st.markdown(f"**{prefix} inputs** (edit anything)")
-        cols = st.columns(3)
-
-        ordered = [
-            "conference strength",
-            "ortg",
-            "drtg",
-            "pythagorean wins",
-            "3ppg",
-        ] + [c for c in FEATURE_COLS if c not in {"conference strength", "ortg", "drtg", "pythagorean wins", "3ppg"}]
-
-        out = {}
-        for i, c in enumerate(ordered):
-            with cols[i % 3]:
-                default_val = float(row[c])
-                if c == "conference strength":
-                    out[c] = float(
-                        st.number_input(
-                            f"{prefix} {c}",
-                            value=int(round(default_val)),
-                            min_value=0,
-                            max_value=25,
-                            step=1,
-                            key=f"ncaab_{prefix}_{c}",
-                        )
-                    )
-                else:
-                    out[c] = float(
-                        st.number_input(
-                            f"{prefix} {c}",
-                            value=default_val,
-                            step=0.1,
-                            key=f"ncaab_{prefix}_{c}",
-                        )
-                    )
-        return out
-
-    left, right = st.columns(2)
-    with left:
-        teamA_stats = stats_editor(teamA_name, "Team A")
-    with right:
-        teamB_stats = stats_editor(teamB_name, "Team B")
-
-    def predict_team_win_pct(stats_dict: dict) -> float:
-        X = pd.DataFrame([stats_dict], columns=FEATURE_COLS)
-        X = _ncaab_apply_emphasis(X, emphasis)
-        pred = float(model.predict(X)[0])
-        return float(np.clip(pred, 0.05, 0.95))
-
-    if st.button("Predict NCAAB Matchup", type="primary", use_container_width=True, key="ncaab_predict_btn"):
-        if teamA_name == teamB_name:
-            st.warning("Pick two different teams.")
-            return
-
-        pA = predict_team_win_pct(teamA_stats)
-        pB = predict_team_win_pct(teamB_stats)
-
-        sA = _ncaab_logit(pA)
-        sB = _ncaab_logit(pB)
-
-        adv = 0.0
-        if home_team == "Team A":
-            adv = HOME_ADV_LOGIT
-        elif home_team == "Team B":
-            adv = -HOME_ADV_LOGIT
-
-        probA = _ncaab_sigmoid((sA - sB) + adv)
-        probB = 1.0 - probA
-
-        st.subheader("Prediction")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric(f"{teamA_name} win probability", f"{probA * 100:.1f}%")
-        with c2:
-            st.metric(f"{teamB_name} win probability", f"{probB * 100:.1f}%")
-        with c3:
-            st.metric("Home adv (logit)", f"{adv:+.2f}")
-
-        st.divider()
-        st.markdown("**Inputs used**")
-        preview = pd.DataFrame(
-            {"Feature": FEATURE_COLS, f"{teamA_name} (A)": [teamA_stats[c] for c in FEATURE_COLS],
-             f"{teamB_name} (B)": [teamB_stats[c] for c in FEATURE_COLS]}
-        )
-        st.dataframe(preview, use_container_width=True)
+    c1, c2 = st.columns(2)
+    c1.metric(f"{home_team} Win Probability", f"{prob_home * 100:.1f}%")
+    c2.metric(f"{away_team} Win Probability", f"{prob_away * 100:.1f}%")
 
 
 # =========================================================
