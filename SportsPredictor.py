@@ -757,7 +757,7 @@ def render_ncaab():
 
     # Emphasis multipliers (conference strength boosted but not crazy)
     EMPHASIS = {
-        "conference strength": 2.0,
+        "conference strength": 1.7,
         "drtg_inv": 1.55,
         "ortg": 1.55,
         "pythagorean wins": 1.45,
