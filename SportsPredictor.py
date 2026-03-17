@@ -46,61 +46,42 @@ def _canonize_name(s: str) -> str:
 
 
 # =========================================================
-# NBA (your conservative clipped edges approach)
+# NBA (updated for NBA_Offense.csv + NBA_Defense.csv)
 # =========================================================
-def _auto_rename_nba(df: pd.DataFrame, is_defense: bool) -> pd.DataFrame:
-    norm2orig = {_canonize_name(c): c for c in df.columns}
-
-    def pick(*cands):
-        for c in cands:
-            if c in norm2orig:
-                return norm2orig[c]
-        return None
-
-    team_col = pick("team", "teams", "franchise", "club", "squad")
-    pts_perg = pick("pts_perg", "points_per_game", "pts_g", "ppg", "pts")
-    fg_pct = pick("fg_pct", "field_goal_pct", "field_goals_pct", "fgp", "fg_percentage")
-    threep_pct = pick("threep_pct", "three_point_pct", "three_point_percentage", "3p_pct", "3pt_pct")
-    reb_perg = pick("reb_perg", "rebounds_per_game", "rebs_perg", "rpg", "trb_perg", "trb_g", "reb")
-
-    rn = {}
-    if team_col:
-        rn[team_col] = "Team"
-    if is_defense:
-        if pts_perg:
-            rn[pts_perg] = "PTS_perG_Allowed"
-        if fg_pct:
-            rn[fg_pct] = "FG_pct_Allowed"
-        if threep_pct:
-            rn[threep_pct] = "ThreeP_pct_Allowed"
-        if reb_perg:
-            rn[reb_perg] = "REB_perG_Allowed"
-    else:
-        if pts_perg:
-            rn[pts_perg] = "PTS_perG"
-        if fg_pct:
-            rn[fg_pct] = "FG_pct"
-        if threep_pct:
-            rn[threep_pct] = "ThreeP_pct"
-        if reb_perg:
-            rn[reb_perg] = "REB_perG"
-
-    return df.rename(columns=rn)
-
-
 @st.cache_data(show_spinner=False)
 def _nba_load_frames(off_path: str, def_path: str):
     off = pd.read_csv(off_path)
     de = pd.read_csv(def_path)
-    off = _auto_rename_nba(off, is_defense=False)
-    de = _auto_rename_nba(de, is_defense=True)
+
+    # Map your current CSV headers to the names this model expects
+    off = off.rename(columns={
+        "PTS": "PTS_perG",
+        "FG%": "FG_pct",
+        "3P%": "ThreeP_pct",
+        "REB": "REB_perG",
+    })
+
+    de = de.rename(columns={
+        "PTS": "PTS_perG_Allowed",
+        "FG%": "FG_pct_Allowed",
+        "3P%": "ThreeP_pct_Allowed",
+        "REB": "REB_perG_Allowed",
+    })
+
     return off, de
 
 
 @st.cache_data(show_spinner=False)
-def _nba_learn_caps_from_grid(off: pd.DataFrame, defn: pd.DataFrame, features: list, q=0.90, default_cap=0.5):
+def _nba_learn_caps_from_grid(
+    off: pd.DataFrame,
+    defn: pd.DataFrame,
+    features: list,
+    q=0.90,
+    default_cap=0.5
+):
     off_means = off.drop(columns=["Team"]).mean(numeric_only=True)
     off_stds = off.drop(columns=["Team"]).std(numeric_only=True).replace(0, 1.0)
+
     def_means = defn.drop(columns=["Team"]).mean(numeric_only=True)
     def_stds = defn.drop(columns=["Team"]).std(numeric_only=True).replace(0, 1.0)
 
@@ -137,13 +118,14 @@ def _nba_learn_caps_from_grid(off: pd.DataFrame, defn: pd.DataFrame, features: l
                 continue
             rows.append(build_edges(off_d[h], off_d[a], def_d[h], def_d[a]))
 
-    df = pd.DataFrame(rows)
+    df_edges = pd.DataFrame(rows)
+
     caps = {}
     for c in features:
-        if c not in df or df[c].dropna().empty:
+        if c not in df_edges or df_edges[c].dropna().empty:
             caps[c] = default_cap
             continue
-        cap = float(np.nanpercentile(np.abs(df[c].values), int(q * 100)))
+        cap = float(np.nanpercentile(np.abs(df_edges[c].values), int(q * 100)))
         if not np.isfinite(cap) or cap < default_cap:
             cap = default_cap
         caps[c] = cap
@@ -156,6 +138,7 @@ def render_nba():
 
     off_path = _find_one(["NBA_Offense.csv", "data/NBA_Offense.csv"])
     def_path = _find_one(["NBA_Defense.csv", "data/NBA_Defense.csv"])
+
     if not off_path or not def_path:
         st.error("Missing NBA CSV files (`NBA_Offense.csv`, `NBA_Defense.csv`).")
         return
@@ -164,13 +147,17 @@ def render_nba():
 
     off_req = {"Team", "PTS_perG", "FG_pct", "ThreeP_pct", "REB_perG"}
     def_req = {"Team", "PTS_perG_Allowed", "FG_pct_Allowed", "ThreeP_pct_Allowed", "REB_perG_Allowed"}
+
     missing = []
     if not off_req.issubset(off.columns):
         missing.append(f"Offense CSV missing: {off_req - set(off.columns)}")
     if not def_req.issubset(defn.columns):
         missing.append(f"Defense CSV missing: {def_req - set(defn.columns)}")
+
     if missing:
         st.error("Column mismatch:\n- " + "\n- ".join(missing))
+        st.write("Offense columns found:", off.columns.tolist())
+        st.write("Defense columns found:", defn.columns.tolist())
         return
 
     FEATURES = [
@@ -246,7 +233,8 @@ def render_nba():
         return float(s)
 
     home = st.selectbox("Home Team", teams, index=0, key="nba_home")
-    away = st.selectbox("Away Team", [t for t in teams if t != home], index=0, key="nba_away")
+    away_options = [t for t in teams if t != home]
+    away = st.selectbox("Away Team", away_options, index=0, key="nba_away")
 
     if home and away and home != away:
         h_off, a_off = off_d[home], off_d[away]
@@ -271,6 +259,7 @@ def render_nba():
 
         st.subheader("Prediction")
         st.success(f"Predicted Winner: {winner}")
+
         c1, c2 = st.columns(2)
         c1.metric(f"{home} Win Probability", f"{p_home * 100:.1f}%")
         c2.metric(f"{away} Win Probability", f"{p_away * 100:.1f}%")
