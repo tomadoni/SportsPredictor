@@ -283,99 +283,116 @@ def render_nba():
 
 
 # =========================================================
-# NHL (your calibrated logistic regression approach)
+# NHL (NO TRAINING DATA — direct stat-based model)
 # =========================================================
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
 @st.cache_data(show_spinner=False)
-def _nhl_load_training(path: str):
-    return pd.read_csv(path)
+def _nhl_load_team_stats(offense_path: str, defense_path: str):
+    offense = pd.read_csv(offense_path)
+    defense = pd.read_csv(defense_path)
 
-
-@st.cache_resource(show_spinner=False)
-def _nhl_fit_model(df: pd.DataFrame):
-    raw_features = ["GF/G", "S%", "PP%", "PIM", "SOG", "GA/G", "SV%", "PK%"]
-    diff_features = ["diff_" + f for f in raw_features]
-    model_features = diff_features + ["home_indicator"]
-
-    X_stats = df[diff_features]
-    X_home = df[["home_indicator"]]
-    y = df["Winner"]
-
-    scaler = StandardScaler()
-    X_stats_scaled = scaler.fit_transform(X_stats)
-    X_combined = np.hstack([X_stats_scaled, X_home.values])
-
-    X_train, X_calib, y_train, y_calib = train_test_split(
-        X_combined, y, test_size=0.2, stratify=y, random_state=42
+    combined = offense.merge(
+        defense.drop(columns=["GP"]),
+        on="Team",
+        suffixes=("_off", "_def")
     )
 
-    lr = LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs")
-    calibrated = CalibratedClassifierCV(estimator=lr, method="sigmoid", cv=5)
-    calibrated.fit(X_train, y_train)
+    return combined
 
-    # metrics (optional)
-    y_pred_train = calibrated.predict(X_train)
-    y_pred_test = calibrated.predict(X_calib)
-    metrics = {
-        "train_acc": accuracy_score(y_train, y_pred_train),
-        "test_acc": accuracy_score(y_calib, y_pred_test),
-        "train_r2": r2_score(y_train, y_pred_train),
-        "test_r2": r2_score(y_calib, y_pred_test),
-        "logloss": log_loss(y_calib, calibrated.predict_proba(X_calib)),
-        "brier": brier_score_loss(y_calib, calibrated.predict_proba(X_calib)[:, 1]),
-        "auc": roc_auc_score(y_calib, calibrated.predict_proba(X_calib)[:, 1]),
-    }
 
-    teams = sorted(set(df["home_team"]).union(df["away_team"]))
-    return calibrated, scaler, diff_features, teams, metrics
+def _sigmoid(x):
+    return 1 / (1 + np.exp(-x))
 
 
 def render_nhl():
     st.header("🏒 NHL Matchup Predictor")
 
-    path = "NHL_Matchup_Training_Data (1).csv"
+    offense_path = "offense_nhl.csv"
+    defense_path = "defense_nhl.csv"
+
     try:
-        df = _nhl_load_training(path)
+        df = _nhl_load_team_stats(offense_path, defense_path)
     except Exception as e:
         st.error(f"Could not load NHL data: {e}")
         return
 
-    calibrated_model, scaler, diff_features, teams, metrics = _nhl_fit_model(df)
+    teams = sorted(df["Team"].unique())
 
-    st.caption("Predict NHL matchups using stat differentials and home-ice advantage.")
+    st.caption("Predict NHL matchups using real team stats (no training data).")
 
     col1, col2 = st.columns(2)
     with col1:
-        home = st.selectbox("🏠 Home Team (NHL)", teams, key="nhl_home")
+        home = st.selectbox("🏠 Home Team", teams)
     with col2:
-        away = st.selectbox("✈️ Away Team (NHL)", teams, key="nhl_away")
+        away = st.selectbox("✈️ Away Team", teams)
 
-    if home != away:
-        matchup = df[(df["home_team"] == home) & (df["away_team"] == away)]
-        if matchup.empty:
-            st.error("Not enough data for this matchup.")
-            return
-
-        stat_diff = np.clip(matchup[diff_features].iloc[0].values, -0.05, 0.05)
-        input_scaled = scaler.transform([stat_diff])
-
-        home_indicator = matchup["home_indicator"].iloc[0] * -20  # your original behavior
-        input_combined = np.hstack([input_scaled, [[home_indicator]]])
-
-        prob = calibrated_model.predict_proba(input_combined)[0]
-        prob_home = float(prob[1])
-        prob_away = float(prob[0])
-        winner = home if prob_home > prob_away else away
-
-        st.subheader("📈 Prediction Result")
-        st.success(f"Predicted Winner: {winner}")
-        c1, c2 = st.columns(2)
-        c1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
-        c2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
-
-        with st.expander("Model metrics (debug)"):
-            st.write({k: round(v, 4) for k, v in metrics.items()})
-    else:
+    if home == away:
         st.warning("Please select two different teams.")
+        return
+
+    home_stats = df[df["Team"] == home].iloc[0]
+    away_stats = df[df["Team"] == away].iloc[0]
+
+    # =====================================================
+    # FEATURES (same logic as your original model)
+    # =====================================================
+    diff_GF = home_stats["GF/G"] - away_stats["GF/G"]
+    diff_Spct = home_stats["S%"] - away_stats["S%"]
+    diff_PP = home_stats["PP%"] - away_stats["PP%"]
+    diff_PIM = away_stats["PIM"] - home_stats["PIM"]  # less penalties = good
+    diff_SOG = home_stats["SOG"] - away_stats["SOG"]
+
+    diff_GA = away_stats["GA/G"] - home_stats["GA/G"]  # lower GA is better
+    diff_SV = home_stats["SV%"] - away_stats["SV%"]
+    diff_PK = home_stats["PK%"] - away_stats["PK%"]
+
+    # =====================================================
+    # WEIGHTS (tuned for realism)
+    # =====================================================
+    score = (
+        3.5 * diff_GF +
+        1.5 * diff_Spct +
+        1.8 * diff_PP +
+        1.2 * diff_SOG +
+        2.5 * diff_SV +
+        2.5 * diff_PK +
+        3.0 * diff_GA +
+        0.5 * diff_PIM +
+        0.15  # home ice advantage
+    )
+
+    prob_home = float(_sigmoid(score))
+    prob_away = 1 - prob_home
+
+    winner = home if prob_home > prob_away else away
+
+    # =====================================================
+    # UI OUTPUT
+    # =====================================================
+    st.subheader("📈 Prediction Result")
+    st.success(f"Predicted Winner: {winner}")
+
+    c1, c2 = st.columns(2)
+    c1.metric(f"{home} Win Probability", f"{prob_home * 100:.1f}%")
+    c2.metric(f"{away} Win Probability", f"{prob_away * 100:.1f}%")
+
+    # Debug / transparency
+    with st.expander("Model Breakdown"):
+        st.write({
+            "GF/G diff": diff_GF,
+            "S% diff": diff_Spct,
+            "PP% diff": diff_PP,
+            "SOG diff": diff_SOG,
+            "SV% diff": diff_SV,
+            "PK% diff": diff_PK,
+            "GA/G diff": diff_GA,
+            "PIM impact": diff_PIM,
+            "Raw Score": score
+        })
 
 
 # =========================================================
