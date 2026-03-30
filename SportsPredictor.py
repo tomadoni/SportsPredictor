@@ -902,13 +902,136 @@ def render_ncaab():
         st.write("Conference delta (home - away):", conf_delta)
         st.write("Conference logit adj:", conf_adj)
 
+
+
+# =========================================================
+# MLS (Poisson + xG + offense/defense model)
+# =========================================================
+import pandas as pd
+import numpy as np
+from math import exp, factorial
+
+
+def _poisson(k, lam):
+    return (exp(-lam) * lam**k) / factorial(k)
+
+
+@st.cache_data(show_spinner=False)
+def _mls_load_data():
+    off = pd.read_csv("mls_offense.csv")
+    de = pd.read_csv("mls_defense.csv")
+    xg = pd.read_csv("mls_xg.csv")
+
+    df = off.merge(de, on="Squad")
+    df = df.merge(xg, on="Squad", how="left")
+
+    # league averages
+    df["Attack"] = df["Gls_per90"] / df["Gls_per90"].mean()
+    df["Defense"] = df["Gls_per90_y"] / df["Gls_per90_y"].mean()
+
+    # incorporate xG
+    df["Attack"] = 0.6 * df["Attack"] + 0.4 * (df["xG"] / df["xG"].mean())
+    df["Defense"] = 0.6 * df["Defense"] + 0.4 * (df["xGA"] / df["xGA"].mean())
+
+    return df
+
+
+def _mls_sim(home, away, df):
+    league_avg = df["Gls_per90"].mean()
+
+    h = df[df["Squad"] == home].iloc[0]
+    a = df[df["Squad"] == away].iloc[0]
+
+    home_xg = league_avg * h["Attack"] * a["Defense"] * 1.1
+    away_xg = league_avg * a["Attack"] * h["Defense"]
+
+    max_goals = 6
+    matrix = np.zeros((max_goals + 1, max_goals + 1))
+
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            matrix[i, j] = _poisson(i, home_xg) * _poisson(j, away_xg)
+
+    home_win = np.tril(matrix, -1).sum()
+    draw = np.trace(matrix)
+    away_win = np.triu(matrix, 1).sum()
+
+    scores = []
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            scores.append((i, j, matrix[i, j]))
+
+    scores = sorted(scores, key=lambda x: x[2], reverse=True)
+
+    return home_xg, away_xg, home_win, draw, away_win, scores
+
+
+def render_mls():
+    st.header("⚽ MLS Predictor")
+
+    try:
+        df = _mls_load_data()
+    except Exception as e:
+        st.error(f"MLS data error: {e}")
+        return
+
+    teams = sorted(df["Squad"].unique())
+
+    col1, col2 = st.columns(2)
+    with col1:
+        home = st.selectbox("Home Team", teams, key="mls_home")
+    with col2:
+        away = st.selectbox("Away Team", teams, key="mls_away")
+
+    if home == away:
+        st.warning("Select different teams.")
+        return
+
+    home_xg, away_xg, p_home, p_draw, p_away, scores = _mls_sim(home, away, df)
+
+    st.subheader("Prediction")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{home} Win %", f"{p_home*100:.1f}%")
+    c2.metric("Draw %", f"{p_draw*100:.1f}%")
+    c3.metric(f"{away} Win %", f"{p_away*100:.1f}%")
+
+    c4, c5 = st.columns(2)
+    c4.metric("Projected Goals (Home)", f"{home_xg:.2f}")
+    c5.metric("Projected Goals (Away)", f"{away_xg:.2f}")
+
+    st.markdown("### Most Likely Scores")
+
+    top = scores[:10]
+    df_scores = pd.DataFrame({
+        "Score": [f"{i}-{j}" for i, j, _ in top],
+        "Probability %": [round(p*100, 2) for _, _, p in top]
+    })
+
+    st.dataframe(df_scores, use_container_width=True)
+
+    st.markdown("### Team Ratings")
+
+    table = df[[
+        "Squad",
+        "Gls_per90",
+        "Gls_per90_y",
+        "xG",
+        "xGA",
+        "Attack",
+        "Defense"
+    ]].sort_values("Attack", ascending=False)
+
+    st.dataframe(table, use_container_width=True)
+
+
 # =========================================================
 # Main App UI (clean selector)
 # =========================================================
 st.title("Sports Predictor App")
 sport = st.selectbox(
     "Choose a sport",
-    ["NBA", "NHL", "MLB", "NFL", "NCAAB"],
+    ["NBA", "NHL", "MLB", "NFL", "NCAAB","MLS"],
     index=0,
     key="sport_selector",
 )
@@ -925,3 +1048,5 @@ elif sport == "NFL":
     render_nfl()
 elif sport == "NCAAB":
     render_ncaab()
+elif sport == "MLS":
+    render_mls()
