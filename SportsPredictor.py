@@ -905,74 +905,134 @@ def render_ncaab():
 
 
 # =========================================================
-# MLS (Poisson + xG + offense/defense model)
+# MLS (clean + stable)
 # =========================================================
 import pandas as pd
 import numpy as np
+import streamlit as st
 from math import exp, factorial
 
 
-def _poisson(k, lam):
-    return (exp(-lam) * lam**k) / factorial(k)
+def _mls_poisson(k, lam):
+    return (exp(-lam) * (lam ** k)) / factorial(k)
 
 
-@st.cache_data(show_spinner=False)
 @st.cache_data(show_spinner=False)
 def _mls_load_data():
-    off = pd.read_csv("mls_offense.csv")
-    de = pd.read_csv("mls_defense.csv")
-    xg = pd.read_csv("mls_xg.csv")
+    off_path = _find_one(["mls_offense.csv", "data/mls_offense.csv"])
+    def_path = _find_one(["mls_defense.csv", "data/mls_defense.csv"])
+    xg_path = _find_one(["mls_xg.csv", "data/mls_xg.csv"])
 
-    df = off.merge(de, on="Squad", suffixes=("_off", "_def"))
+    if not off_path or not def_path or not xg_path:
+        raise FileNotFoundError("Missing one or more MLS CSV files: mls_offense.csv, mls_defense.csv, mls_xg.csv")
+
+    off = pd.read_csv(off_path)
+    de = pd.read_csv(def_path)
+    xg = pd.read_csv(xg_path)
+
+    # Keep only needed columns so merge stays clean
+    off = off[["Squad", "Poss", "Gls_per90", "Ast_per90", "G+A_per90", "G-PK_per90", "G+A-PK_per90"]].copy()
+    de = de[["Squad", "Poss", "Gls_per90", "Ast_per90", "G+A_per90", "G-PK_per90", "G+A-PK_per90"]].copy()
+    xg = xg[["Squad", "xG", "xGA", "xGD", "GF", "GA", "xG_vs_Actual"]].copy()
+
+    off = off.rename(columns={
+        "Poss": "Poss_off",
+        "Gls_per90": "GF_per90",
+        "Ast_per90": "Ast_per90_off",
+        "G+A_per90": "GA_per90_off",
+        "G-PK_per90": "GPK_per90_off",
+        "G+A-PK_per90": "GAPK_per90_off",
+    })
+
+    de = de.rename(columns={
+        "Poss": "Poss_def",
+        "Gls_per90": "GA_per90",
+        "Ast_per90": "AstA_per90",
+        "G+A_per90": "GAA_per90",
+        "G-PK_per90": "GPKA_per90",
+        "G+A-PK_per90": "GAPKA_per90",
+    })
+
+    df = off.merge(de, on="Squad", how="inner")
     df = df.merge(xg, on="Squad", how="left")
 
-    # rename for clarity
-    df["GF_per90"] = df["Gls_per90_off"]     # scoring
-    df["GA_per90"] = df["Gls_per90_def"]     # allowed
+    # force numeric
+    numeric_cols = [c for c in df.columns if c != "Squad"]
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["GF_per90", "GA_per90", "xG", "xGA"]).reset_index(drop=True)
 
     # league averages
     league_avg_gf = df["GF_per90"].mean()
     league_avg_ga = df["GA_per90"].mean()
+    league_avg_xg = df["xG"].mean()
+    league_avg_xga = df["xGA"].mean()
+    league_avg_poss = df["Poss_off"].mean()
 
-    # base strengths
-    df["Attack"] = df["GF_per90"] / league_avg_gf
-    df["Defense"] = df["GA_per90"] / league_avg_ga
+    # attack / defense ratings
+    df["Attack"] = (
+        0.50 * (df["GF_per90"] / league_avg_gf) +
+        0.35 * (df["xG"] / league_avg_xg) +
+        0.15 * (df["Poss_off"] / league_avg_poss)
+    )
 
-    # blend with xG (VERY important)
-    df["Attack"] = 0.6 * df["Attack"] + 0.4 * (df["xG"] / df["xG"].mean())
-    df["Defense"] = 0.6 * df["Defense"] + 0.4 * (df["xGA"] / df["xGA"].mean())
+    # Higher GA/xGA means weaker defense, so this is a weakness factor
+    df["Defense_Weakness"] = (
+        0.55 * (df["GA_per90"] / league_avg_ga) +
+        0.45 * (df["xGA"] / league_avg_xga)
+    )
+
+    # Power rating for sorting/display
+    df["Power_Rating"] = (
+        0.40 * df["Attack"]
+        - 0.35 * df["Defense_Weakness"]
+        + 0.25 * df["xGD"]
+    )
 
     return df
 
 
-def _mls_sim(home, away, df):
-    league_avg = df["Gls_per90"].mean()
+def _mls_sim_match(home_team, away_team, df, max_goals=6):
+    home = df[df["Squad"] == home_team].iloc[0]
+    away = df[df["Squad"] == away_team].iloc[0]
 
-    h = df[df["Squad"] == home].iloc[0]
-    a = df[df["Squad"] == away].iloc[0]
+    league_avg_goals = df["GF_per90"].mean()
 
-    home_xg = league_avg * h["Attack"] * a["Defense"] * 1.1
-    away_xg = league_avg * a["Attack"] * h["Defense"]
+    # Expected goals
+    home_xg = league_avg_goals * home["Attack"] * away["Defense_Weakness"] * 1.10
+    away_xg = league_avg_goals * away["Attack"] * home["Defense_Weakness"]
 
-    max_goals = 6
-    matrix = np.zeros((max_goals + 1, max_goals + 1))
+    home_xg = max(home_xg, 0.05)
+    away_xg = max(away_xg, 0.05)
 
+    home_probs = [_mls_poisson(i, home_xg) for i in range(max_goals + 1)]
+    away_probs = [_mls_poisson(i, away_xg) for i in range(max_goals + 1)]
+
+    matrix = np.outer(home_probs, away_probs)
+
+    p_home = np.tril(matrix, -1).sum()
+    p_draw = np.trace(matrix)
+    p_away = np.triu(matrix, 1).sum()
+
+    rows = []
     for i in range(max_goals + 1):
         for j in range(max_goals + 1):
-            matrix[i, j] = _poisson(i, home_xg) * _poisson(j, away_xg)
+            rows.append({
+                "Scoreline": f"{i}-{j}",
+                "Probability": matrix[i, j]
+            })
 
-    home_win = np.tril(matrix, -1).sum()
-    draw = np.trace(matrix)
-    away_win = np.triu(matrix, 1).sum()
+    score_df = pd.DataFrame(rows).sort_values("Probability", ascending=False).reset_index(drop=True)
 
-    scores = []
-    for i in range(max_goals + 1):
-        for j in range(max_goals + 1):
-            scores.append((i, j, matrix[i, j]))
-
-    scores = sorted(scores, key=lambda x: x[2], reverse=True)
-
-    return home_xg, away_xg, home_win, draw, away_win, scores
+    return {
+        "home_xg": home_xg,
+        "away_xg": away_xg,
+        "p_home": p_home,
+        "p_draw": p_draw,
+        "p_away": p_away,
+        "score_df": score_df,
+    }
 
 
 def render_mls():
@@ -984,54 +1044,58 @@ def render_mls():
         st.error(f"MLS data error: {e}")
         return
 
-    teams = sorted(df["Squad"].unique())
+    teams = sorted(df["Squad"].dropna().unique().tolist())
+
+    if len(teams) < 2:
+        st.error("Not enough MLS teams found in the merged data.")
+        return
 
     col1, col2 = st.columns(2)
     with col1:
-        home = st.selectbox("Home Team", teams, key="mls_home")
+        home = st.selectbox("Home Team", teams, key="mls_home_team")
     with col2:
-        away = st.selectbox("Away Team", teams, key="mls_away")
+        away_choices = [t for t in teams if t != home]
+        away = st.selectbox("Away Team", away_choices, key="mls_away_team")
 
-    if home == away:
-        st.warning("Select different teams.")
-        return
-
-    home_xg, away_xg, p_home, p_draw, p_away, scores = _mls_sim(home, away, df)
+    result = _mls_sim_match(home, away, df)
 
     st.subheader("Prediction")
 
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"{home} Win %", f"{p_home*100:.1f}%")
-    c2.metric("Draw %", f"{p_draw*100:.1f}%")
-    c3.metric(f"{away} Win %", f"{p_away*100:.1f}%")
+    c1.metric(f"{home} Win Probability", f"{result['p_home'] * 100:.1f}%")
+    c2.metric("Draw Probability", f"{result['p_draw'] * 100:.1f}%")
+    c3.metric(f"{away} Win Probability", f"{result['p_away'] * 100:.1f}%")
 
     c4, c5 = st.columns(2)
-    c4.metric("Projected Goals (Home)", f"{home_xg:.2f}")
-    c5.metric("Projected Goals (Away)", f"{away_xg:.2f}")
+    c4.metric(f"{home} Projected Goals", f"{result['home_xg']:.2f}")
+    c5.metric(f"{away} Projected Goals", f"{result['away_xg']:.2f}")
 
-    st.markdown("### Most Likely Scores")
+    st.markdown("### Most Likely Scorelines")
+    top_scores = result["score_df"].head(10).copy()
+    top_scores["Probability"] = (top_scores["Probability"] * 100).round(2)
+    st.dataframe(top_scores, use_container_width=True)
 
-    top = scores[:10]
-    df_scores = pd.DataFrame({
-        "Score": [f"{i}-{j}" for i, j, _ in top],
-        "Probability %": [round(p*100, 2) for _, _, p in top]
-    })
-
-    st.dataframe(df_scores, use_container_width=True)
-
-    st.markdown("### Team Ratings")
-
+    st.markdown("### MLS Team Ratings")
     table = df[[
-        "Squad",
-        "Gls_per90",
-        "Gls_per90_y",
-        "xG",
-        "xGA",
-        "Attack",
-        "Defense"
-    ]].sort_values("Attack", ascending=False)
+        "Squad", "GF_per90", "GA_per90", "xG", "xGA", "xGD", "Attack", "Defense_Weakness", "Power_Rating"
+    ]].copy()
 
-    st.dataframe(table, use_container_width=True)
+    table = table.sort_values("Power_Rating", ascending=False).reset_index(drop=True)
+    table.index = table.index + 1
+
+    st.dataframe(
+        table.style.format({
+            "GF_per90": "{:.2f}",
+            "GA_per90": "{:.2f}",
+            "xG": "{:.2f}",
+            "xGA": "{:.2f}",
+            "xGD": "{:.2f}",
+            "Attack": "{:.2f}",
+            "Defense_Weakness": "{:.2f}",
+            "Power_Rating": "{:.2f}",
+        }),
+        use_container_width=True
+    )
 
 
 # =========================================================
