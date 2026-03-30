@@ -917,19 +917,28 @@ def _poisson(k, lam):
 
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def _mls_load_data():
     off = pd.read_csv("mls_offense.csv")
     de = pd.read_csv("mls_defense.csv")
     xg = pd.read_csv("mls_xg.csv")
 
-    df = off.merge(de, on="Squad")
+    df = off.merge(de, on="Squad", suffixes=("_off", "_def"))
     df = df.merge(xg, on="Squad", how="left")
 
-    # league averages
-    df["Attack"] = df["Gls_per90"] / df["Gls_per90"].mean()
-    df["Defense"] = df["Gls_per90_y"] / df["Gls_per90_y"].mean()
+    # rename for clarity
+    df["GF_per90"] = df["Gls_per90_off"]     # scoring
+    df["GA_per90"] = df["Gls_per90_def"]     # allowed
 
-    # incorporate xG
+    # league averages
+    league_avg_gf = df["GF_per90"].mean()
+    league_avg_ga = df["GA_per90"].mean()
+
+    # base strengths
+    df["Attack"] = df["GF_per90"] / league_avg_gf
+    df["Defense"] = df["GA_per90"] / league_avg_ga
+
+    # blend with xG (VERY important)
     df["Attack"] = 0.6 * df["Attack"] + 0.4 * (df["xG"] / df["xG"].mean())
     df["Defense"] = 0.6 * df["Defense"] + 0.4 * (df["xGA"] / df["xGA"].mean())
 
