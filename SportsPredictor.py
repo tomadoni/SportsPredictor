@@ -1098,13 +1098,352 @@ def render_mls():
     )
 
 
+
+# =========================================================
+# WORLD CUP SECTION
+# =========================================================
+import os
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
+# ---------------------------------------------------------
+# FILE PATHS
+# Update these if your files live somewhere else
+# ---------------------------------------------------------
+WORLD_CUP_TEAM_STATS_PATH = "world_cup_team_stats.xls"
+WORLD_CUP_RECENT_GAMES_PATH = "world_cup_recent_games.xls"
+
+
+# ---------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------
+def _canon_team_name(name: str) -> str:
+    return (
+        str(name)
+        .strip()
+        .lower()
+        .replace("’", "'")
+        .replace("é", "e")
+        .replace("ô", "o")
+    )
+
+
+@st.cache_data
+def load_world_cup_data():
+    team_stats = pd.read_csv(WORLD_CUP_TEAM_STATS_PATH)
+    recent_games = pd.read_csv(WORLD_CUP_RECENT_GAMES_PATH)
+
+    # numeric cleanup
+    team_num_cols = [
+        "games_played", "wins", "draws", "losses", "goals_for", "goals_against",
+        "goal_diff", "points", "points_per_game", "avg_goals_for",
+        "avg_goals_against", "clean_sheets", "failed_to_score",
+        "home_games", "away_games", "recent_form_points_5"
+    ]
+    for col in team_num_cols:
+        if col in team_stats.columns:
+            team_stats[col] = pd.to_numeric(team_stats[col], errors="coerce").fillna(0)
+
+    recent_num_cols = ["is_home", "goals_for", "goals_against", "goal_diff", "points"]
+    for col in recent_num_cols:
+        if col in recent_games.columns:
+            recent_games[col] = pd.to_numeric(recent_games[col], errors="coerce")
+
+    if "result" in recent_games.columns:
+        recent_games["result"] = recent_games["result"].fillna("")
+
+    # make a power score for matchup predictions
+    team_stats = build_world_cup_power_ratings(team_stats)
+
+    return team_stats, recent_games
+
+
+def build_world_cup_power_ratings(team_stats: pd.DataFrame) -> pd.DataFrame:
+    df = team_stats.copy()
+
+    feature_weights = {
+        "points_per_game": 0.35,
+        "avg_goals_for": 0.20,
+        "avg_goals_against": -0.20,
+        "goal_diff": 0.15,
+        "clean_sheets": 0.05,
+        "recent_form_points_5": 0.05,
+    }
+
+    # if all the data is flat / zero, still create the column
+    for col in feature_weights:
+        if col not in df.columns:
+            df[col] = 0
+
+    score = np.zeros(len(df), dtype=float)
+
+    for col, weight in feature_weights.items():
+        series = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        col_range = series.max() - series.min()
+
+        if col_range == 0:
+            scaled = pd.Series(np.zeros(len(series)), index=series.index)
+        else:
+            scaled = (series - series.min()) / col_range
+
+        score += scaled * weight
+
+    df["power_score"] = score
+
+    # rescale to 0-100 for display
+    if df["power_score"].max() - df["power_score"].min() == 0:
+        df["power_score_display"] = 50.0
+    else:
+        df["power_score_display"] = (
+            100
+            * (df["power_score"] - df["power_score"].min())
+            / (df["power_score"].max() - df["power_score"].min())
+        ).round(1)
+
+    return df.sort_values(
+        ["power_score", "points_per_game", "goal_diff", "avg_goals_for"],
+        ascending=False
+    ).reset_index(drop=True)
+
+
+def world_cup_matchup_prediction(team_stats: pd.DataFrame, team_a: str, team_b: str):
+    row_a = team_stats[team_stats["team"] == team_a]
+    row_b = team_stats[team_stats["team"] == team_b]
+
+    if row_a.empty or row_b.empty:
+        return 50.0, 50.0, None
+
+    row_a = row_a.iloc[0]
+    row_b = row_b.iloc[0]
+
+    # if data is flat, keep it honest
+    if (
+        float(team_stats["power_score"].std()) == 0
+        or (team_stats["points_per_game"].sum() == 0 and team_stats["goal_diff"].sum() == 0)
+    ):
+        return 50.0, 50.0, "Current World Cup files do not yet contain usable score-based team strength data, so this matchup is shown as 50/50."
+
+    diff = float(row_a["power_score"] - row_b["power_score"])
+
+    # logistic transform
+    team_a_prob = 1 / (1 + np.exp(-7 * diff))
+    team_b_prob = 1 - team_a_prob
+
+    return round(team_a_prob * 100, 1), round(team_b_prob * 100, 1), None
+
+
+def get_team_recent_games(recent_games: pd.DataFrame, team_name: str):
+    df = recent_games[recent_games["team"] == team_name].copy()
+
+    # best effort sort by existing order in file
+    return df.reset_index(drop=True)
+
+
+# ---------------------------------------------------------
+# MAIN WORLD CUP UI
+# ---------------------------------------------------------
+def render_world_cup_section():
+    st.header("World Cup Predictor")
+
+    if not os.path.exists(WORLD_CUP_TEAM_STATS_PATH):
+        st.error(f"Missing file: {WORLD_CUP_TEAM_STATS_PATH}")
+        return
+
+    if not os.path.exists(WORLD_CUP_RECENT_GAMES_PATH):
+        st.error(f"Missing file: {WORLD_CUP_RECENT_GAMES_PATH}")
+        return
+
+    team_stats, recent_games = load_world_cup_data()
+
+    st.caption("Using: world_cup_team_stats.xls and world_cup_recent_games.xls")
+
+    if team_stats.empty:
+        st.warning("No World Cup team stats found.")
+        return
+
+    # helpful honesty if the file is still mostly empty
+    if (
+        team_stats["points_per_game"].sum() == 0
+        and team_stats["goal_diff"].sum() == 0
+        and team_stats["goals_for"].sum() == 0
+    ):
+        st.warning(
+            "Your current World Cup stats file looks incomplete: the score-based columns are all zero right now. "
+            "This section will still load, but matchup probabilities will stay flat until those stats are populated."
+        )
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Power Rankings",
+        "Matchup Predictor",
+        "Team Explorer",
+        "Recent Games"
+    ])
+
+    # -----------------------------------------------------
+    # TAB 1: POWER RANKINGS
+    # -----------------------------------------------------
+    with tab1:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Teams", len(team_stats))
+        c2.metric("Avg Matches", round(team_stats["games_played"].mean(), 1))
+        c3.metric("Top Team", team_stats.iloc[0]["team"] if len(team_stats) else "N/A")
+        c4.metric(
+            "Top Power Score",
+            f"{team_stats.iloc[0]['power_score_display']:.1f}" if len(team_stats) else "N/A"
+        )
+
+        rankings_display = team_stats.copy()
+        rankings_display.insert(0, "rank", range(1, len(rankings_display) + 1))
+
+        show_cols = [
+            "rank", "team", "power_score_display", "games_played", "points_per_game",
+            "avg_goals_for", "avg_goals_against", "goal_diff", "clean_sheets",
+            "recent_form_points_5"
+        ]
+        show_cols = [c for c in show_cols if c in rankings_display.columns]
+
+        st.dataframe(
+            rankings_display[show_cols].rename(columns={
+                "power_score_display": "power_score"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        chart_df = rankings_display.head(15).set_index("team")[["power_score_display"]]
+        st.bar_chart(chart_df)
+
+    # -----------------------------------------------------
+    # TAB 2: MATCHUP PREDICTOR
+    # -----------------------------------------------------
+    with tab2:
+        teams = sorted(team_stats["team"].dropna().unique().tolist())
+
+        col1, col2 = st.columns(2)
+        with col1:
+            team_a = st.selectbox("Team A", teams, index=teams.index("Argentina") if "Argentina" in teams else 0, key="wc_team_a")
+        with col2:
+            default_b_index = teams.index("France") if "France" in teams else min(1, len(teams) - 1)
+            team_b = st.selectbox("Team B", teams, index=default_b_index, key="wc_team_b")
+
+        if team_a == team_b:
+            st.info("Choose two different teams.")
+        else:
+            team_a_prob, team_b_prob, note = world_cup_matchup_prediction(team_stats, team_a, team_b)
+
+            st.subheader(f"{team_a} vs {team_b}")
+
+            m1, m2 = st.columns(2)
+            m1.metric(f"{team_a} Win Probability", f"{team_a_prob}%")
+            m2.metric(f"{team_b} Win Probability", f"{team_b_prob}%")
+
+            if note:
+                st.info(note)
+
+            row_a = team_stats[team_stats["team"] == team_a].iloc[0]
+            row_b = team_stats[team_stats["team"] == team_b].iloc[0]
+
+            compare_df = pd.DataFrame({
+                "Metric": [
+                    "Power Score",
+                    "Games Played",
+                    "Points Per Game",
+                    "Avg Goals For",
+                    "Avg Goals Against",
+                    "Goal Diff",
+                    "Clean Sheets",
+                    "Recent Form Points (Last 5)"
+                ],
+                team_a: [
+                    row_a.get("power_score_display", 0),
+                    row_a.get("games_played", 0),
+                    row_a.get("points_per_game", 0),
+                    row_a.get("avg_goals_for", 0),
+                    row_a.get("avg_goals_against", 0),
+                    row_a.get("goal_diff", 0),
+                    row_a.get("clean_sheets", 0),
+                    row_a.get("recent_form_points_5", 0),
+                ],
+                team_b: [
+                    row_b.get("power_score_display", 0),
+                    row_b.get("games_played", 0),
+                    row_b.get("points_per_game", 0),
+                    row_b.get("avg_goals_for", 0),
+                    row_b.get("avg_goals_against", 0),
+                    row_b.get("goal_diff", 0),
+                    row_b.get("clean_sheets", 0),
+                    row_b.get("recent_form_points_5", 0),
+                ],
+            })
+
+            st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+    # -----------------------------------------------------
+    # TAB 3: TEAM EXPLORER
+    # -----------------------------------------------------
+    with tab3:
+        teams = sorted(team_stats["team"].dropna().unique().tolist())
+        selected_team = st.selectbox("Select a team", teams, key="wc_team_explorer")
+
+        row = team_stats[team_stats["team"] == selected_team].iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Power Score", f"{row.get('power_score_display', 0):.1f}")
+        c2.metric("Points Per Game", f"{row.get('points_per_game', 0):.2f}")
+        c3.metric("Avg Goals For", f"{row.get('avg_goals_for', 0):.2f}")
+        c4.metric("Avg Goals Against", f"{row.get('avg_goals_against', 0):.2f}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Goal Diff", int(row.get("goal_diff", 0)))
+        c6.metric("Clean Sheets", int(row.get("clean_sheets", 0)))
+        c7.metric("Home Games", int(row.get("home_games", 0)))
+        c8.metric("Away Games", int(row.get("away_games", 0)))
+
+        st.dataframe(
+            pd.DataFrame([row]).drop(columns=["power_score"], errors="ignore"),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        team_games = get_team_recent_games(recent_games, selected_team)
+        if not team_games.empty:
+            st.subheader(f"{selected_team} Recent Matches")
+            st.dataframe(team_games, use_container_width=True, hide_index=True)
+        else:
+            st.info("No recent matches found for this team.")
+
+    # -----------------------------------------------------
+    # TAB 4: RECENT GAMES
+    # -----------------------------------------------------
+    with tab4:
+        teams = ["All Teams"] + sorted(recent_games["team"].dropna().unique().tolist())
+        selected_filter_team = st.selectbox("Filter by team", teams, key="wc_recent_games_filter")
+
+        games_view = recent_games.copy()
+        if selected_filter_team != "All Teams":
+            games_view = games_view[games_view["team"] == selected_filter_team]
+
+        st.dataframe(games_view, use_container_width=True, hide_index=True)
+
+        csv_data = games_view.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download filtered recent games CSV",
+            data=csv_data,
+            file_name="world_cup_recent_games_filtered.csv",
+            mime="text/csv"
+        )
+
+
+
 # =========================================================
 # Main App UI (clean selector)
 # =========================================================
 st.title("Sports Predictor App")
 sport = st.selectbox(
     "Choose a sport",
-    ["NBA", "NHL", "MLB", "NFL", "NCAAB","MLS"],
+    ["NBA", "NHL", "MLB", "NFL", "NCAAB", "MLS", "World Cup"],
     index=0,
     key="sport_selector",
 )
@@ -1123,3 +1462,5 @@ elif sport == "NCAAB":
     render_ncaab()
 elif sport == "MLS":
     render_mls()
+elif sport == "World Cup":
+    render_world_cup_section()
