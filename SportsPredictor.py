@@ -1352,30 +1352,24 @@ def build_world_cup_power_ratings(team_stats: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------
 # MATCHUP PREDICTION
 # ---------------------------------------------------------
-def world_cup_matchup_prediction(team_stats: pd.DataFrame, team_a: str, team_b: str):
-    row_a = team_stats[team_stats["team"] == team_a]
-    row_b = team_stats[team_stats["team"] == team_b]
 
-    if row_a.empty or row_b.empty:
-        return 50.0, 50.0, None
-
-    row_a = row_a.iloc[0]
-    row_b = row_b.iloc[0]
-
-    if (
-        float(team_stats["power_score"].std()) == 0
-        or (team_stats["points_per_game"].sum() == 0 and team_stats["goal_diff"].sum() == 0)
-    ):
-        return 50.0, 50.0, "Current World Cup files do not yet contain usable score-based team strength data, so this matchup is shown as 50/50."
+def world_cup_matchup_prediction(team_stats, team_a, team_b):
+    row_a = team_stats[team_stats["team"] == team_a].iloc[0]
+    row_b = team_stats[team_stats["team"] == team_b].iloc[0]
 
     diff = float(row_a["power_score"] - row_b["power_score"])
 
-    # stronger separation
-    team_a_prob = 1 / (1 + np.exp(-8.5 * diff))
+    # 1. soften the curve (reduce slope)
+    raw_prob = 1 / (1 + np.exp(-4.5 * diff))
+
+    # 2. clip extremes
+    min_prob = 0.25
+    max_prob = 0.75
+
+    team_a_prob = min(max(raw_prob, min_prob), max_prob)
     team_b_prob = 1 - team_a_prob
 
     return round(team_a_prob * 100, 1), round(team_b_prob * 100, 1), None
-
 
 def get_team_recent_games(recent_games: pd.DataFrame, team_name: str):
     df = recent_games[recent_games["team"] == team_name].copy()
