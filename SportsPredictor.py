@@ -1359,14 +1359,23 @@ def world_cup_matchup_prediction(team_stats, team_a, team_b):
 
     diff = float(row_a["power_score"] - row_b["power_score"])
 
-    # 1. soften the curve (reduce slope)
-    raw_prob = 1 / (1 + np.exp(-4.5 * diff))
+    # --------------------------------------------------
+    # 1. COMPRESS DIFFERENCES (THIS IS THE KEY FIX)
+    # --------------------------------------------------
+    diff = diff / 3.0   # ← adjust this if needed (2.5–4 range)
 
-    # 2. clip extremes
-    min_prob = 0.25
-    max_prob = 0.75
+    # --------------------------------------------------
+    # 2. GENTLER SIGMOID
+    # --------------------------------------------------
+    raw_prob = 1 / (1 + np.exp(-3.0 * diff))
 
-    team_a_prob = min(max(raw_prob, min_prob), max_prob)
+    # --------------------------------------------------
+    # 3. SOFT CLIPPING (NOT HARD CUT)
+    # pulls extreme values back toward 50
+    # --------------------------------------------------
+    shrink_factor = 0.65
+    team_a_prob = 0.5 + (raw_prob - 0.5) * shrink_factor
+
     team_b_prob = 1 - team_a_prob
 
     return round(team_a_prob * 100, 1), round(team_b_prob * 100, 1), None
