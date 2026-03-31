@@ -1132,10 +1132,24 @@ def _canon_team_name(name: str) -> str:
 
 @st.cache_data
 def load_world_cup_data():
-    team_stats = pd.read_excel(WORLD_CUP_TEAM_STATS_PATH)
-    recent_games = pd.read_excel(WORLD_CUP_RECENT_GAMES_PATH)
+    def smart_read_table(path):
+        path_lower = str(path).lower()
 
-    # numeric cleanup
+        # first try CSV, because your "xls" files have really been CSV-style files
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            pass
+
+        # then try Excel only if CSV failed
+        try:
+            return pd.read_excel(path)
+        except Exception as e:
+            raise ValueError(f"Could not read file '{path}'. It is likely not a real Excel file. Original error: {e}")
+
+    team_stats = smart_read_table(WORLD_CUP_TEAM_STATS_PATH)
+    recent_games = smart_read_table(WORLD_CUP_RECENT_GAMES_PATH)
+
     team_num_cols = [
         "games_played", "wins", "draws", "losses", "goals_for", "goals_against",
         "goal_diff", "points", "points_per_game", "avg_goals_for",
@@ -1149,12 +1163,11 @@ def load_world_cup_data():
     recent_num_cols = ["is_home", "goals_for", "goals_against", "goal_diff", "points"]
     for col in recent_num_cols:
         if col in recent_games.columns:
-            recent_games[col] = pd.to_numeric(recent_games[col], errors="coerce")
+            recent_games[col] = pd.to_numeric(recent_games[col], errors="coerce").fillna(0)
 
     if "result" in recent_games.columns:
         recent_games["result"] = recent_games["result"].fillna("")
 
-    # make a power score for matchup predictions
     team_stats = build_world_cup_power_ratings(team_stats)
 
     return team_stats, recent_games
