@@ -1373,7 +1373,7 @@ def world_cup_matchup_prediction(team_stats, team_a, team_b):
     # 3. SOFT CLIPPING (NOT HARD CUT)
     # pulls extreme values back toward 50
     # --------------------------------------------------
-    shrink_factor = 0.9
+    shrink_factor = 1.1
     team_a_prob = 0.5 + (raw_prob - 0.5) * shrink_factor
 
     team_b_prob = 1 - team_a_prob
