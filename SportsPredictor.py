@@ -1112,8 +1112,8 @@ import streamlit as st
 # FILE PATHS
 # Update these if your files live somewhere else
 # ---------------------------------------------------------
-WORLD_CUP_TEAM_STATS_PATH = "world_cup_team_stats.xls"
-WORLD_CUP_RECENT_GAMES_PATH = "world_cup_recent_games.xls"
+WORLD_CUP_TEAM_STATS_PATH = "world_cup_team_stats_final.xls"
+WORLD_CUP_RECENT_GAMES_PATH = "world_cup_recent_games_final.xls"
 
 
 # ---------------------------------------------------------
@@ -1132,8 +1132,8 @@ def _canon_team_name(name: str) -> str:
 
 @st.cache_data
 def load_world_cup_data():
-    team_stats = pd.read_csv(WORLD_CUP_TEAM_STATS_PATH)
-    recent_games = pd.read_csv(WORLD_CUP_RECENT_GAMES_PATH)
+    team_stats = pd.read_excel(WORLD_CUP_TEAM_STATS_PATH)
+    recent_games = pd.read_excel(WORLD_CUP_RECENT_GAMES_PATH)
 
     # numeric cleanup
     team_num_cols = [
