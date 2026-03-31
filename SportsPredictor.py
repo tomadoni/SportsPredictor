@@ -1110,46 +1110,140 @@ import streamlit as st
 
 # ---------------------------------------------------------
 # FILE PATHS
-# Update these if your files live somewhere else
 # ---------------------------------------------------------
 WORLD_CUP_TEAM_STATS_PATH = "world_cup_team_stats_final.xls"
 WORLD_CUP_RECENT_GAMES_PATH = "world_cup_recent_games_final.xls"
+FIFA_RANKINGS_PATH = "fifa_rankings.csv"
 
 
 # ---------------------------------------------------------
-# HELPERS
+# CONFEDERATION MAP
+# ---------------------------------------------------------
+CONFEDERATION_MAP = {
+    "Canada": "CONCACAF",
+    "Mexico": "CONCACAF",
+    "USA": "CONCACAF",
+    "Panama": "CONCACAF",
+    "Haiti": "CONCACAF",
+    "Curacao": "CONCACAF",
+
+    "Australia": "AFC",
+    "Iran": "AFC",
+    "Japan": "AFC",
+    "Jordan": "AFC",
+    "Qatar": "AFC",
+    "Saudi Arabia": "AFC",
+    "South Korea": "AFC",
+    "Uzbekistan": "AFC",
+
+    "Algeria": "CAF",
+    "Cabo Verde": "CAF",
+    "Cote d'Ivoire": "CAF",
+    "Egypt": "CAF",
+    "Ghana": "CAF",
+    "Morocco": "CAF",
+    "Senegal": "CAF",
+    "South Africa": "CAF",
+    "Tunisia": "CAF",
+    "DR Congo": "CAF",
+
+    "Austria": "UEFA",
+    "Belgium": "UEFA",
+    "Croatia": "UEFA",
+    "England": "UEFA",
+    "France": "UEFA",
+    "Germany": "UEFA",
+    "Netherlands": "UEFA",
+    "Norway": "UEFA",
+    "Portugal": "UEFA",
+    "Scotland": "UEFA",
+    "Spain": "UEFA",
+    "Switzerland": "UEFA",
+    "Italy": "UEFA",
+    "Denmark": "UEFA",
+    "Sweden": "UEFA",
+    "Turkey": "UEFA",
+
+    "Argentina": "CONMEBOL",
+    "Brazil": "CONMEBOL",
+    "Colombia": "CONMEBOL",
+    "Ecuador": "CONMEBOL",
+    "Paraguay": "CONMEBOL",
+    "Uruguay": "CONMEBOL",
+    "Bolivia": "CONMEBOL",
+
+    "New Zealand": "OFC",
+}
+
+CONFEDERATION_WEIGHTS = {
+    "UEFA": 1.42,
+    "CONMEBOL": 1.34,
+    "CAF": 1.00,
+    "CONCACAF": 0.90,
+    "AFC": 0.84,
+    "OFC": 0.76,
+}
+
+
+# ---------------------------------------------------------
+# TEAM NAME NORMALIZATION
 # ---------------------------------------------------------
 def _canon_team_name(name: str) -> str:
-    return (
-        str(name)
-        .strip()
-        .lower()
-        .replace("’", "'")
-        .replace("é", "e")
-        .replace("ô", "o")
-    )
+    name = str(name).strip().lower()
+    replacements = {
+        "’": "'",
+        "é": "e",
+        "ô": "o",
+        "ç": "c",
+        "á": "a",
+        "í": "i",
+        "ú": "u",
+        "ü": "u",
+    }
+    for old, new in replacements.items():
+        name = name.replace(old, new)
+
+    aliases = {
+        "united states": "usa",
+        "us": "usa",
+        "ir iran": "iran",
+        "korea republic": "south korea",
+        "turkiye": "turkey",
+        "turkiye ": "turkey",
+        "côte d'ivoire": "cote d'ivoire",
+        "cape verde": "cabo verde",
+        "congo dr": "dr congo",
+        "congo, democratic republic": "dr congo",
+        "curaçao": "curacao",
+    }
+    return aliases.get(name, name)
 
 
+# ---------------------------------------------------------
+# SMART FILE READER
+# ---------------------------------------------------------
+def _smart_read_table(path: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        pass
+
+    try:
+        return pd.read_excel(path)
+    except Exception as e:
+        raise ValueError(f"Could not read file '{path}'. Original error: {e}")
+
+
+# ---------------------------------------------------------
+# LOAD DATA
+# ---------------------------------------------------------
 @st.cache_data
 def load_world_cup_data():
-    def smart_read_table(path):
-        path_lower = str(path).lower()
+    team_stats = _smart_read_table(WORLD_CUP_TEAM_STATS_PATH)
+    recent_games = _smart_read_table(WORLD_CUP_RECENT_GAMES_PATH)
+    fifa = pd.read_csv(FIFA_RANKINGS_PATH)
 
-        # first try CSV, because your "xls" files have really been CSV-style files
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            pass
-
-        # then try Excel only if CSV failed
-        try:
-            return pd.read_excel(path)
-        except Exception as e:
-            raise ValueError(f"Could not read file '{path}'. It is likely not a real Excel file. Original error: {e}")
-
-    team_stats = smart_read_table(WORLD_CUP_TEAM_STATS_PATH)
-    recent_games = smart_read_table(WORLD_CUP_RECENT_GAMES_PATH)
-
+    # numeric cleanup
     team_num_cols = [
         "games_played", "wins", "draws", "losses", "goals_for", "goals_against",
         "goal_diff", "points", "points_per_game", "avg_goals_for",
@@ -1168,44 +1262,78 @@ def load_world_cup_data():
     if "result" in recent_games.columns:
         recent_games["result"] = recent_games["result"].fillna("")
 
+    # normalize names
+    team_stats["team_clean"] = team_stats["team"].apply(_canon_team_name)
+    recent_games["team_clean"] = recent_games["team"].apply(_canon_team_name)
+    fifa["team_clean"] = fifa["team"].apply(_canon_team_name)
+
+    fifa["rank"] = pd.to_numeric(fifa["rank"], errors="coerce")
+    fifa["points"] = pd.to_numeric(fifa["points"], errors="coerce")
+
+    # merge fifa rankings
+    team_stats = team_stats.merge(
+        fifa[["team_clean", "rank", "points"]].rename(
+            columns={"rank": "fifa_rank", "points": "fifa_points"}
+        ),
+        on="team_clean",
+        how="left"
+    )
+
+    # add confederation
+    team_stats["confederation"] = team_stats["team"].map(CONFEDERATION_MAP).fillna("UNKNOWN")
+    team_stats["conf_weight"] = team_stats["confederation"].map(CONFEDERATION_WEIGHTS).fillna(1.0)
+
+    # power score
     team_stats = build_world_cup_power_ratings(team_stats)
 
     return team_stats, recent_games
 
 
+# ---------------------------------------------------------
+# POWER RATINGS
+# ---------------------------------------------------------
 def build_world_cup_power_ratings(team_stats: pd.DataFrame) -> pd.DataFrame:
     df = team_stats.copy()
 
     feature_weights = {
-        "points_per_game": 0.35,
-        "avg_goals_for": 0.20,
-        "avg_goals_against": -0.20,
-        "goal_diff": 0.15,
-        "clean_sheets": 0.05,
-        "recent_form_points_5": 0.05,
+        "points_per_game": 0.22,
+        "avg_goals_for": 0.10,
+        "avg_goals_against": -0.10,
+        "goal_diff": 0.08,
+        "clean_sheets": 0.04,
+        "recent_form_points_5": 0.06,
+        "fifa_points": 0.20,
+        "fifa_rank_inverse": 0.20,
     }
 
-    # if all the data is flat / zero, still create the column
+    # fifa ranking strength
+    df["fifa_points"] = pd.to_numeric(df.get("fifa_points", 0), errors="coerce").fillna(0)
+    df["fifa_rank"] = pd.to_numeric(df.get("fifa_rank", 0), errors="coerce")
+    df["fifa_rank_inverse"] = np.where(df["fifa_rank"] > 0, 1 / df["fifa_rank"], 0)
+
     for col in feature_weights:
         if col not in df.columns:
             df[col] = 0
 
-    score = np.zeros(len(df), dtype=float)
+    base_score = np.zeros(len(df), dtype=float)
 
     for col, weight in feature_weights.items():
         series = pd.to_numeric(df[col], errors="coerce").fillna(0)
         col_range = series.max() - series.min()
 
         if col_range == 0:
-            scaled = pd.Series(np.zeros(len(series)), index=series.index)
+            scaled = np.zeros(len(series))
         else:
             scaled = (series - series.min()) / col_range
 
-        score += scaled * weight
+        base_score += scaled * weight
 
-    df["power_score"] = score
+    df["base_power_score"] = base_score
 
-    # rescale to 0-100 for display
+    # apply confederation weight strongly
+    df["power_score"] = df["base_power_score"] * df["conf_weight"]
+
+    # rescale to 0-100
     if df["power_score"].max() - df["power_score"].min() == 0:
         df["power_score_display"] = 50.0
     else:
@@ -1216,11 +1344,14 @@ def build_world_cup_power_ratings(team_stats: pd.DataFrame) -> pd.DataFrame:
         ).round(1)
 
     return df.sort_values(
-        ["power_score", "points_per_game", "goal_diff", "avg_goals_for"],
+        ["power_score", "fifa_points", "points_per_game", "goal_diff"],
         ascending=False
     ).reset_index(drop=True)
 
 
+# ---------------------------------------------------------
+# MATCHUP PREDICTION
+# ---------------------------------------------------------
 def world_cup_matchup_prediction(team_stats: pd.DataFrame, team_a: str, team_b: str):
     row_a = team_stats[team_stats["team"] == team_a]
     row_b = team_stats[team_stats["team"] == team_b]
@@ -1231,7 +1362,6 @@ def world_cup_matchup_prediction(team_stats: pd.DataFrame, team_a: str, team_b: 
     row_a = row_a.iloc[0]
     row_b = row_b.iloc[0]
 
-    # if data is flat, keep it honest
     if (
         float(team_stats["power_score"].std()) == 0
         or (team_stats["points_per_game"].sum() == 0 and team_stats["goal_diff"].sum() == 0)
@@ -1240,8 +1370,8 @@ def world_cup_matchup_prediction(team_stats: pd.DataFrame, team_a: str, team_b: 
 
     diff = float(row_a["power_score"] - row_b["power_score"])
 
-    # logistic transform
-    team_a_prob = 1 / (1 + np.exp(-7 * diff))
+    # stronger separation
+    team_a_prob = 1 / (1 + np.exp(-8.5 * diff))
     team_b_prob = 1 - team_a_prob
 
     return round(team_a_prob * 100, 1), round(team_b_prob * 100, 1), None
@@ -1250,7 +1380,10 @@ def world_cup_matchup_prediction(team_stats: pd.DataFrame, team_a: str, team_b: 
 def get_team_recent_games(recent_games: pd.DataFrame, team_name: str):
     df = recent_games[recent_games["team"] == team_name].copy()
 
-    # best effort sort by existing order in file
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.sort_values("date", ascending=False)
+
     return df.reset_index(drop=True)
 
 
@@ -1268,24 +1401,17 @@ def render_world_cup_section():
         st.error(f"Missing file: {WORLD_CUP_RECENT_GAMES_PATH}")
         return
 
+    if not os.path.exists(FIFA_RANKINGS_PATH):
+        st.error(f"Missing file: {FIFA_RANKINGS_PATH}")
+        return
+
     team_stats, recent_games = load_world_cup_data()
 
-    st.caption("Using: world_cup_team_stats.xls and world_cup_recent_games.xls")
+    st.caption("Using World Cup recent games, final team stats, FIFA rankings, and confederation weighting.")
 
     if team_stats.empty:
         st.warning("No World Cup team stats found.")
         return
-
-    # helpful honesty if the file is still mostly empty
-    if (
-        team_stats["points_per_game"].sum() == 0
-        and team_stats["goal_diff"].sum() == 0
-        and team_stats["goals_for"].sum() == 0
-    ):
-        st.warning(
-            "Your current World Cup stats file looks incomplete: the score-based columns are all zero right now. "
-            "This section will still load, but matchup probabilities will stay flat until those stats are populated."
-        )
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Power Rankings",
@@ -1311,8 +1437,18 @@ def render_world_cup_section():
         rankings_display.insert(0, "rank", range(1, len(rankings_display) + 1))
 
         show_cols = [
-            "rank", "team", "power_score_display", "games_played", "points_per_game",
-            "avg_goals_for", "avg_goals_against", "goal_diff", "clean_sheets",
+            "rank",
+            "team",
+            "confederation",
+            "fifa_rank",
+            "fifa_points",
+            "power_score_display",
+            "games_played",
+            "points_per_game",
+            "avg_goals_for",
+            "avg_goals_against",
+            "goal_diff",
+            "clean_sheets",
             "recent_form_points_5"
         ]
         show_cols = [c for c in show_cols if c in rankings_display.columns]
@@ -1336,10 +1472,20 @@ def render_world_cup_section():
 
         col1, col2 = st.columns(2)
         with col1:
-            team_a = st.selectbox("Team A", teams, index=teams.index("Argentina") if "Argentina" in teams else 0, key="wc_team_a")
+            team_a = st.selectbox(
+                "Team A",
+                teams,
+                index=teams.index("Argentina") if "Argentina" in teams else 0,
+                key="wc_team_a"
+            )
         with col2:
             default_b_index = teams.index("France") if "France" in teams else min(1, len(teams) - 1)
-            team_b = st.selectbox("Team B", teams, index=default_b_index, key="wc_team_b")
+            team_b = st.selectbox(
+                "Team B",
+                teams,
+                index=default_b_index,
+                key="wc_team_b"
+            )
 
         if team_a == team_b:
             st.info("Choose two different teams.")
@@ -1361,6 +1507,9 @@ def render_world_cup_section():
             compare_df = pd.DataFrame({
                 "Metric": [
                     "Power Score",
+                    "FIFA Rank",
+                    "FIFA Points",
+                    "Confederation",
                     "Games Played",
                     "Points Per Game",
                     "Avg Goals For",
@@ -1371,6 +1520,9 @@ def render_world_cup_section():
                 ],
                 team_a: [
                     row_a.get("power_score_display", 0),
+                    row_a.get("fifa_rank", np.nan),
+                    row_a.get("fifa_points", np.nan),
+                    row_a.get("confederation", ""),
                     row_a.get("games_played", 0),
                     row_a.get("points_per_game", 0),
                     row_a.get("avg_goals_for", 0),
@@ -1381,6 +1533,9 @@ def render_world_cup_section():
                 ],
                 team_b: [
                     row_b.get("power_score_display", 0),
+                    row_b.get("fifa_rank", np.nan),
+                    row_b.get("fifa_points", np.nan),
+                    row_b.get("confederation", ""),
                     row_b.get("games_played", 0),
                     row_b.get("points_per_game", 0),
                     row_b.get("avg_goals_for", 0),
@@ -1404,18 +1559,18 @@ def render_world_cup_section():
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Power Score", f"{row.get('power_score_display', 0):.1f}")
-        c2.metric("Points Per Game", f"{row.get('points_per_game', 0):.2f}")
-        c3.metric("Avg Goals For", f"{row.get('avg_goals_for', 0):.2f}")
-        c4.metric("Avg Goals Against", f"{row.get('avg_goals_against', 0):.2f}")
+        c2.metric("FIFA Rank", int(row.get("fifa_rank", 0)) if pd.notna(row.get("fifa_rank", np.nan)) else "N/A")
+        c3.metric("FIFA Points", f"{row.get('fifa_points', 0):.2f}" if pd.notna(row.get("fifa_points", np.nan)) else "N/A")
+        c4.metric("Confederation", row.get("confederation", "N/A"))
 
         c5, c6, c7, c8 = st.columns(4)
-        c5.metric("Goal Diff", int(row.get("goal_diff", 0)))
-        c6.metric("Clean Sheets", int(row.get("clean_sheets", 0)))
-        c7.metric("Home Games", int(row.get("home_games", 0)))
-        c8.metric("Away Games", int(row.get("away_games", 0)))
+        c5.metric("Points Per Game", f"{row.get('points_per_game', 0):.2f}")
+        c6.metric("Avg Goals For", f"{row.get('avg_goals_for', 0):.2f}")
+        c7.metric("Avg Goals Against", f"{row.get('avg_goals_against', 0):.2f}")
+        c8.metric("Goal Diff", f"{row.get('goal_diff', 0):.2f}")
 
         st.dataframe(
-            pd.DataFrame([row]).drop(columns=["power_score"], errors="ignore"),
+            pd.DataFrame([row]).drop(columns=["power_score", "base_power_score", "team_clean"], errors="ignore"),
             use_container_width=True,
             hide_index=True
         )
