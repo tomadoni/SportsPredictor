@@ -1111,8 +1111,8 @@ import streamlit as st
 # ---------------------------------------------------------
 # FILE PATHS
 # ---------------------------------------------------------
-WORLD_CUP_TEAM_STATS_PATH = "world_cup_team_stats_final.xls"
-WORLD_CUP_RECENT_GAMES_PATH = "world_cup_recent_games_final.xls"
+WORLD_CUP_TEAM_STATS_PATH = "world_cup_team_stats_updated.xls"
+WORLD_CUP_RECENT_GAMES_PATH = "world_cup_recent_games_updated.xls"
 FIFA_RANKINGS_PATH = "fifa_rankings.csv"
 
 
@@ -1135,6 +1135,7 @@ CONFEDERATION_MAP = {
     "Saudi Arabia": "AFC",
     "South Korea": "AFC",
     "Uzbekistan": "AFC",
+    "Iraq" : "AFC",
 
     "Algeria": "CAF",
     "Cabo Verde": "CAF",
@@ -1159,8 +1160,8 @@ CONFEDERATION_MAP = {
     "Scotland": "UEFA",
     "Spain": "UEFA",
     "Switzerland": "UEFA",
-    "Italy": "UEFA",
-    "Denmark": "UEFA",
+    "Bosnia & Herzegovina": "UEFA",
+    "Czechia": "UEFA",
     "Sweden": "UEFA",
     "Turkey": "UEFA",
 
@@ -1170,7 +1171,6 @@ CONFEDERATION_MAP = {
     "Ecuador": "CONMEBOL",
     "Paraguay": "CONMEBOL",
     "Uruguay": "CONMEBOL",
-    "Bolivia": "CONMEBOL",
 
     "New Zealand": "OFC",
 }
