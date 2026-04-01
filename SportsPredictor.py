@@ -1160,8 +1160,8 @@ CONFEDERATION_MAP = {
     "Scotland": "UEFA",
     "Spain": "UEFA",
     "Switzerland": "UEFA",
-    "Bosnia & Herzegovina": "UEFA",
-    "Czechia": "UEFA",
+    "Bosnia and Herzegovina": "UEFA",
+    "Czech Republic": "UEFA",
     "Sweden": "UEFA",
     "Turkey": "UEFA",
 
