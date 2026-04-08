@@ -1302,8 +1302,8 @@ def build_world_cup_power_ratings(team_stats: pd.DataFrame) -> pd.DataFrame:
         "goal_diff": 0.08,
         "clean_sheets": 0.04,
         "recent_form_points_5": 0.06,
-        "fifa_points": 0.30,
-        "fifa_rank_inverse": 0.40,
+        "fifa_points": 0.50,
+        "fifa_rank_inverse": 0.60,
     }
 
     # fifa ranking strength
