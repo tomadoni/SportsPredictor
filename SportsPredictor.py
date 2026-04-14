@@ -1176,8 +1176,8 @@ CONFEDERATION_MAP = {
 }
 
 CONFEDERATION_WEIGHTS = {
-    "UEFA": 1.20,
-    "CONMEBOL": 1.09,
+    "UEFA": 1.35,
+    "CONMEBOL": 1.29,
     "CAF": 0.77,
     "CONCACAF": 0.7,
     "AFC": 0.65,
