@@ -1176,12 +1176,12 @@ CONFEDERATION_MAP = {
 }
 
 CONFEDERATION_WEIGHTS = {
-    "UEFA": 1.22,
-    "CONMEBOL": 1.05,
-    "CAF": 0.83,
+    "UEFA": 1.20,
+    "CONMEBOL": 1.09,
+    "CAF": 0.87,
     "CONCACAF": 0.8,
     "AFC": 0.74,
-    "OFC": 0.66,
+    "OFC": 0.50,
 }
 
 
@@ -1302,8 +1302,7 @@ def build_world_cup_power_ratings(team_stats: pd.DataFrame) -> pd.DataFrame:
         "goal_diff": 0.18,
         "clean_sheets": 0.09,
         "recent_form_points_5": 0.19,
-        "fifa_points": 0.20,
-        "fifa_rank_inverse": 0.20,
+        "fifa_rank_inverse": 0.40,
     }
 
     # fifa ranking strength
